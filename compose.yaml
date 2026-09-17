@@ -1,0 +1,52 @@
+services:
+  postgresql:
+    image: postgres:17.6
+    ports:
+      - "127.0.0.1:5432:5432"
+    environment:
+      POSTGRES_DB: eapn
+      POSTGRES_USER: ${DB_USER:-eapn}
+      POSTGRES_PASSWORD: ${DB_PASSWORD:-eapn_dev}
+      TZ: ${APP_TIMEZONE:-America/Asuncion}
+      PGTZ: ${APP_TIMEZONE:-America/Asuncion}
+    volumes:
+      - postgresql_data:/var/lib/postgresql/data
+      - ./docker/postgres/init.sql:/docker-entrypoint-initdb.d/01-init.sql:ro
+    healthcheck:
+      test: ["CMD-SHELL", "pg_isready -U \"$$POSTGRES_USER\" -d \"$$POSTGRES_DB\""]
+      interval: 10s
+      timeout: 5s
+      retries: 10
+      start_period: 20s
+
+  artemis:
+    image: apache/activemq-artemis:2.44.0-alpine
+    ports:
+      - "127.0.0.1:61616:61616"
+      - "127.0.0.1:8161:8161"
+    environment:
+      ARTEMIS_USER: ${ARTEMIS_USER:-eapn}
+      ARTEMIS_PASSWORD: ${ARTEMIS_PASSWORD:-eapn_dev}
+      ANONYMOUS_LOGIN: "false"
+      TZ: ${APP_TIMEZONE:-America/Asuncion}
+    volumes:
+      - artemis_data:/var/lib/artemis-instance
+    healthcheck:
+      test:
+        - CMD-SHELL
+        - /var/lib/artemis-instance/bin/artemis check node --url tcp://localhost:61616 --user "$$ARTEMIS_USER" --password "$$ARTEMIS_PASSWORD" --up
+      interval: 15s
+      timeout: 10s
+      retries: 10
+      start_period: 40s
+
+  wiremock:
+    image: wiremock/wiremock:3.13.1
+    ports:
+      - "127.0.0.1:8081:8080"
+    volumes:
+      - ./wiremock:/home/wiremock:ro
+
+volumes:
+  postgresql_data:
+  artemis_data:
