@@ -285,6 +285,41 @@ class PortabilityRequestRepositoryTest {
         return params.getValue();
     }
 
+    @Test
+    void confirmationAtomicallyIncrementsAttemptsAndSetsDateOnlyInGeneratedState() {
+        when(jdbc.update(anyString(), any(MapSqlParameterSource.class))).thenReturn(1);
+        assertThat(repository.confirmPin("req-1", CONFIRMED)).isEqualTo(1);
+        var params = captureUpdate("""
+                UPDATE portability_request
+                SET estado = 'CONFIRMED', fecha_pin_confirmado = :fechaPinConfirmado,
+                    intentos_confirmacion = intentos_confirmacion + 1, motivo_rechazo = NULL
+                WHERE id = :id AND estado = 'PIN_GENERATED'
+                """);
+        assertThat(params.getValues()).hasSize(2).containsEntry("fechaPinConfirmado", CONFIRMED);
+        assertThat(params.getSqlType("fechaPinConfirmado")).isEqualTo(Types.TIMESTAMP_WITH_TIMEZONE);
+    }
+
+    @Test
+    void pinRejectionAtomicallyIncrementsAttemptsAndStoresReasonWithoutCompletion() {
+        when(jdbc.update(anyString(), any(MapSqlParameterSource.class))).thenReturn(1);
+        assertThat(repository.rejectPinConfirmation("req-1", "El PIN ha expirado.")).isEqualTo(1);
+        var params = captureUpdate("""
+                UPDATE portability_request
+                SET estado = 'REJECTED', motivo_rechazo = :motivo,
+                    intentos_confirmacion = intentos_confirmacion + 1
+                WHERE id = :id AND estado = 'PIN_GENERATED'
+                """);
+        assertThat(params.getValues()).hasSize(2).containsEntry("motivo", "El PIN ha expirado.");
+        assertThat(params.getSqlType("motivo")).isEqualTo(Types.VARCHAR);
+    }
+
+    @Test
+    void confirmationWritesExposeNoMatchingRow() {
+        when(jdbc.update(anyString(), any(MapSqlParameterSource.class))).thenReturn(0);
+        assertThat(repository.confirmPin("missing", CONFIRMED)).isZero();
+        assertThat(repository.rejectPinConfirmation("missing", "El PIN es incorrecto.")).isZero();
+    }
+
     private PortabilityRequest request() {
         return new PortabilityRequest("req-1", "595981123456", "0012345", "DONANTE", "RECEPTOR",
                 PortabilityStatus.REJECTED, "001234", EXPIRES, 2, CREATED, GENERATED, CONFIRMED,
