@@ -62,6 +62,26 @@ Errores de validación o JSON devuelven HTTP 400 con
 devuelve HTTP 500; no se informa como rechazo de negocio ni como creación exitosa.
 Los tests de servicio y HTTP usan mocks de persistencia, sin infraestructura externa.
 
+## Consulta de portabilidad
+
+`GET http://localhost:8080/portabilidad/{id}` consulta el estado persistido mediante
+Camel REST DSL → `PortabilityQueryService` → `PortabilityRequestRepository.findById`.
+No modifica la solicitud ni envía mensajes a operadores.
+
+HTTP 200 devuelve un DTO público con `id`, `msisdn`, `operador_donante`,
+`operador_receptor`, `estado`, `fecha_creacion`, `fecha_pin_generado`,
+`fecha_pin_confirmado` y `fecha_completada`. Las fechas son ISO 8601; los hitos
+no alcanzados conservan `null`. En estado `REJECTED` se incluye `motivo_rechazo`
+si está disponible. Un motivo técnico de entrega de PIN no se publica como rechazo.
+No se devuelven PIN, expiración, documento, intentos ni datos internos JMS.
+
+Una solicitud inexistente devuelve HTTP 404 con
+`{"estado":"RECHAZADA","mensaje":"La solicitud de portabilidad no existe."}`.
+Un fallo técnico devuelve HTTP 500 con
+`{"estado":"ERROR","mensaje":"No se pudo consultar la solicitud."}`,
+sin detalles de la excepción. La consulta permite observar también estados
+transitorios como CONFIRMED, PENDING_DONOR y APPROVED.
+
 ## Generación y envío de PIN
 
 `PinGenerationService` genera seis dígitos con `SecureRandom` (incluye ceros
@@ -373,3 +393,18 @@ El broker Docker sigue siendo Artemis 2.44.0 y no se necesita Docker para los te
 
 Referencias: [JMS Request-Reply de Camel](https://camel.apache.org/components/4.18.x/jms-component.html)
 y [Dead Letter Channel](https://camel.apache.org/components/4.18.x/eips/dead-letter-channel.html).
+
+
+### Verificación de una instalación limpia
+
+Compose monta `init.sql` como `01-init.sql` y `messaging.sql` como
+`02-messaging.sql` dentro de `/docker-entrypoint-initdb.d/`. En un volumen nuevo,
+PostgreSQL ejecuta ambos: crea automáticamente `portability_request`,
+`ported_number` y `processed_message`. La ejecución manual de `messaging.sql`
+solo corresponde a volúmenes antiguos que todavía no tienen esa tabla.
+
+`PostgresInitializationTest` comprueba los montajes y su orden, y ejecuta los
+scripts reales sin modificarlos sobre una base H2 vacía, con un alias de
+compatibilidad para TIMESTAMPTZ. Esta prueba no sustituye una ejecución del
+contenedor PostgreSQL, pero detecta scripts faltantes y tablas no inicializadas.
+La revisión no requiere ejecutar `docker compose down -v` ni borrar datos locales.
