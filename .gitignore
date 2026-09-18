@@ -16,3 +16,14 @@ logs/
 .env
 .env.*
 !.env.example
+
+# Secretos y copias locales de datos; los volúmenes nombrados viven fuera del repo.
+/secrets/
+*.key
+*.pem
+*.p12
+*.pfx
+*.jks
+/postgresql_data/
+/artemis_data/
+/docker/data/
