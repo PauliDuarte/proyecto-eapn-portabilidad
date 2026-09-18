@@ -57,7 +57,7 @@ import static com.github.tomakehurst.wiremock.client.WireMock.*;
 
 @CamelSpringBootTest
 @SpringBootTest(webEnvironment = SpringBootTest.WebEnvironment.RANDOM_PORT,
-        properties = {"camel.springboot.main-run-controller=false", "app.donor-approval.response-timeout-ms=1000",
+        properties = {"camel.springboot.main-run-controller=false", "app.messaging.enabled=false", "app.donor-approval.response-timeout-ms=1000",
                 "app.receiver-notification.response-timeout-ms=1000"})
 @DirtiesContext(classMode = DirtiesContext.ClassMode.AFTER_CLASS)
 class PinConfirmationRouteTest {

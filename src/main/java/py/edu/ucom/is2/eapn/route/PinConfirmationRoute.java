@@ -14,6 +14,8 @@ import org.springframework.stereotype.Component;
 import org.slf4j.Logger;
 import org.slf4j.LoggerFactory;
 
+import py.edu.ucom.is2.eapn.messaging.StateEventPublisher;
+import py.edu.ucom.is2.eapn.model.PortabilityStatus;
 import py.edu.ucom.is2.eapn.model.PortabilityRequest;
 import py.edu.ucom.is2.eapn.model.dto.DonorApprovalResponse;
 import py.edu.ucom.is2.eapn.model.dto.ConfirmPinRequest;
@@ -35,13 +37,15 @@ public class PinConfirmationRoute extends RouteBuilder {
     private final DonorApprovalService approvalService;
     private final PortabilityFinalizationService finalizationService;
     private final ObjectMapper mapper;
+    private final StateEventPublisher events;
 
     public PinConfirmationRoute(PinConfirmationService service, DonorApprovalService approvalService,
-            PortabilityFinalizationService finalizationService, ObjectMapper mapper) {
+            PortabilityFinalizationService finalizationService, ObjectMapper mapper, StateEventPublisher events) {
         this.service = service;
         this.approvalService = approvalService;
         this.finalizationService = finalizationService;
         this.mapper = mapper;
+        this.events = events;
     }
 
     @Override
@@ -85,6 +89,7 @@ public class PinConfirmationRoute extends RouteBuilder {
                 .maximumRedeliveries(0).handled(true)
                 .process(exchange -> {
                     var failure = exchange.getProperty(Exchange.EXCEPTION_CAUGHT, PinConfirmationException.class);
+                    events.publish(failure.stateEvent());
                     int status = switch (failure.reason()) {
                         case NOT_FOUND -> 404;
                         case INVALID_STATE, MISSING_PIN, STATE_CHANGED -> 409;
@@ -123,16 +128,29 @@ public class PinConfirmationRoute extends RouteBuilder {
                 .process(exchange -> {
                     String id = exchange.getMessage().getHeader("id", String.class);
                     var input = exchange.getMessage().getBody(ConfirmPinRequest.class);
-                    exchange.getMessage().setBody(service.confirm(id, input));
+                    var confirmed = service.confirm(id, input);
+                    events.publish(confirmed);
+                    exchange.getMessage().setBody(confirmed);
                 })
                 .process(exchange -> exchange.getMessage().setBody(
                         approvalService.begin(exchange.getMessage().getBody(PortabilityRequest.class))))
                 .to("direct:solicitar-aprobacion-donante")
                 .process(exchange -> exchange.getMessage().setBody(
                         approvalService.applyDecision(exchange.getMessage().getBody(DonorApprovalResponse.class))))
+                .process(exchange -> {
+                    var request = exchange.getProperty(DonorApprovalRoute.REQUEST_PROPERTY, PortabilityRequest.class);
+                    var decision = exchange.getMessage().getBody(ConfirmPinResponse.class);
+                    events.publish(request.id(), request.msisdn(), decision.estado());
+                })
                 .process(exchange -> exchange.getMessage().setBody(finalizationService.finish(
                         exchange.getProperty(DonorApprovalRoute.REQUEST_PROPERTY, PortabilityRequest.class),
                         exchange.getMessage().getBody(ConfirmPinResponse.class))))
+                .process(exchange -> {
+                    var result = exchange.getMessage().getBody(PortabilityResultNotification.class);
+                    if (result.estado() == PortabilityStatus.COMPLETED) {
+                        events.publish(result.requestId(), result.msisdn(), result.estado());
+                    }
+                })
                 // finish() es un bean transaccional: al retornar, el commit ya terminó.
                 .to("direct:notificar-resultado-receptor")
                 .process(exchange -> exchange.getMessage().setBody(

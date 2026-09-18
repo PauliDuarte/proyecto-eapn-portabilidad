@@ -6,6 +6,7 @@ import java.util.regex.Pattern;
 
 import org.springframework.stereotype.Service;
 
+import py.edu.ucom.is2.eapn.messaging.StateEvent;
 import py.edu.ucom.is2.eapn.model.PortabilityStatus;
 import py.edu.ucom.is2.eapn.model.PortabilityRequest;
 import py.edu.ucom.is2.eapn.model.dto.ConfirmPinRequest;
@@ -44,10 +45,10 @@ public class PinConfirmationService {
         OffsetDateTime now = OffsetDateTime.now(clock);
         // La expiración tiene prioridad si el PIN está además equivocado.
         if (!now.isBefore(request.pinExpiracion())) {
-            reject(id, EXPIRED_PIN, "El PIN ha expirado.");
+            reject(request, now, EXPIRED_PIN, "El PIN ha expirado.");
         }
         if (!request.pin().equals(input.pin())) {
-            reject(id, INCORRECT_PIN, "El PIN es incorrecto.");
+            reject(request, now, INCORRECT_PIN, "El PIN es incorrecto.");
         }
 
         requireUpdated(repository.confirmPin(id, now));
@@ -57,10 +58,11 @@ public class PinConfirmationService {
                 request.fechaCreacion(), request.fechaPinGenerado(), now, request.fechaCompletada(), null);
     }
 
-    private void reject(String id, PinConfirmationException.Reason reason, String message) {
+    private void reject(PortabilityRequest request, OffsetDateTime now, PinConfirmationException.Reason reason, String message) {
         // El UPDATE incluye el intento. No envolver en una transacción que revierta al lanzar este error.
-        requireUpdated(repository.rejectPinConfirmation(id, message));
-        throw new PinConfirmationException(reason, message);
+        requireUpdated(repository.rejectPinConfirmation(request.id(), message));
+        throw new PinConfirmationException(reason, message,
+                new StateEvent(request.id(), request.msisdn(), PortabilityStatus.REJECTED, now, "STATE_CHANGED"));
     }
 
     private void requireUpdated(int rows) {

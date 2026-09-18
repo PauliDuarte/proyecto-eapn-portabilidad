@@ -7,7 +7,6 @@ import org.apache.camel.builder.RouteBuilder;
 import org.apache.camel.component.jackson.JacksonDataFormat;
 import org.springframework.stereotype.Component;
 
-import py.edu.ucom.is2.eapn.model.PortabilityRequest;
 import py.edu.ucom.is2.eapn.model.dto.PinNotificationRequest;
 import py.edu.ucom.is2.eapn.model.dto.PinNotificationResponse;
 
@@ -23,19 +22,14 @@ public class PinNotificationRoute extends RouteBuilder {
 
     @Override
     public void configure() {
-        // Propagar al flujo REST; no reintentar ni registrar cuerpos que contienen PIN.
+        // El consumidor JMS controla los reintentos; no registrar cuerpos con PIN.
         errorHandler(noErrorHandler());
 
-        from("direct:enviar-pin-operador").routeId("enviar-pin-operador")
+        from("direct:enviar-pin-operador-http").routeId("enviar-pin-operador-http")
                 .setProperty(REQUEST_PROPERTY, body())
-                .removeHeaders("*")
+                .removeHeaders("*", "operator")
                 .doTry()
-                    .process(exchange -> {
-                        var request = exchange.getProperty(REQUEST_PROPERTY, PortabilityRequest.class);
-                        exchange.getMessage().setHeader("X-Operador-Donante", request.operadorDonante());
-                        exchange.getMessage().setBody(new PinNotificationRequest(request.id(), request.msisdn(),
-                                request.documentoTitular(), request.pin()));
-                    })
+                    .to("direct:seleccionar-donante")
                     .marshal(new JacksonDataFormat(mapper, PinNotificationRequest.class))
                     .to("{{app.wiremock.base-url}}/operador/pin-notification"
                             + "?httpMethod=POST&bridgeEndpoint=true&skipControlHeaders=true"
@@ -49,13 +43,13 @@ public class PinNotificationRoute extends RouteBuilder {
                     })
                     .unmarshal(new JacksonDataFormat(mapper, PinNotificationResponse.class))
                     .process(exchange -> {
-                        var request = exchange.getProperty(REQUEST_PROPERTY, PortabilityRequest.class);
+                        var request = exchange.getProperty(REQUEST_PROPERTY, PinNotificationRequest.class);
                         var confirmation = exchange.getMessage().getBody(PinNotificationResponse.class);
-                        if (confirmation == null || !request.id().equals(confirmation.requestId())
+                        if (confirmation == null || !request.requestId().equals(confirmation.requestId())
                                 || !"PIN_ENVIADO".equals(confirmation.estado())) {
                             throw new DonorNotificationException("Confirmación del donante inválida o sin correlación.");
                         }
-                        exchange.getMessage().setBody(request);
+                        exchange.getMessage().setBody(new PinNotificationResponse(request.requestId(), "PIN_ENVIADO", null));
                     })
                 .doCatch(Exception.class)
                     .process(exchange -> {

@@ -11,7 +11,6 @@ import org.apache.camel.builder.RouteBuilder;
 import org.apache.camel.component.jackson.JacksonDataFormat;
 import org.springframework.stereotype.Component;
 
-import py.edu.ucom.is2.eapn.model.PortabilityRequest;
 import py.edu.ucom.is2.eapn.model.dto.DonorApprovalRequest;
 import py.edu.ucom.is2.eapn.model.dto.DonorApprovalResponse;
 import py.edu.ucom.is2.eapn.service.DonorApprovalException;
@@ -35,16 +34,11 @@ public class DonorApprovalRoute extends RouteBuilder {
                 .setCoercion(CoercionInputShape.Float, CoercionAction.Fail)
                 .setCoercion(CoercionInputShape.Boolean, CoercionAction.Fail);
 
-        from("direct:solicitar-aprobacion-donante").routeId("solicitar-aprobacion-donante")
+        from("direct:solicitar-aprobacion-donante-http").routeId("solicitar-aprobacion-donante-http")
                 .setProperty(REQUEST_PROPERTY, body())
-                .removeHeaders("*")
+                .removeHeaders("*", "operator")
                 .doTry()
-                    .process(exchange -> {
-                        var request = exchange.getProperty(REQUEST_PROPERTY, PortabilityRequest.class);
-                        exchange.getMessage().setHeader("X-Operador-Donante", request.operadorDonante());
-                        exchange.getMessage().setBody(new DonorApprovalRequest(request.id(), request.msisdn(),
-                                request.documentoTitular(), request.operadorReceptor()));
-                    })
+                    .to("direct:seleccionar-donante")
                     .marshal(new JacksonDataFormat(mapper, DonorApprovalRequest.class))
                     .to("{{app.wiremock.base-url}}/operador/portability-approval"
                             + "?httpMethod=POST&bridgeEndpoint=true&skipControlHeaders=true"
@@ -59,9 +53,9 @@ public class DonorApprovalRoute extends RouteBuilder {
                     })
                     .unmarshal(new JacksonDataFormat(responseMapper, DonorApprovalResponse.class))
                     .process(exchange -> {
-                        var request = exchange.getProperty(REQUEST_PROPERTY, PortabilityRequest.class);
+                        var request = exchange.getProperty(REQUEST_PROPERTY, DonorApprovalRequest.class);
                         var decision = exchange.getMessage().getBody(DonorApprovalResponse.class);
-                        if (decision == null || !request.id().equals(decision.requestId())) {
+                        if (decision == null || !request.requestId().equals(decision.requestId())) {
                             throw new DonorApprovalException("Respuesta de aprobación sin correlación válida.");
                         }
                         if (!"APPROVED".equals(decision.estado()) && !"REJECTED".equals(decision.estado())) {

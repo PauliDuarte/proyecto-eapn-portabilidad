@@ -27,14 +27,11 @@ public class ReceiverNotificationRoute extends RouteBuilder {
         errorHandler(noErrorHandler());
         var responseMapper = mapper.copy().enable(DeserializationFeature.FAIL_ON_TRAILING_TOKENS);
 
-        from("direct:notificar-resultado-receptor").routeId("notificar-resultado-receptor")
+        from("direct:notificar-resultado-receptor-http").routeId("notificar-resultado-receptor-http")
                 .setProperty(RESULT_PROPERTY, body())
-                .removeHeaders("*")
+                .removeHeaders("*", "operator")
                 .doTry()
-                    .process(exchange -> {
-                        var result = exchange.getProperty(RESULT_PROPERTY, PortabilityResultNotification.class);
-                        exchange.getMessage().setHeader("X-Operador-Receptor", result.operadorReceptor());
-                    })
+                    .to("direct:seleccionar-receptor")
                     .marshal(new JacksonDataFormat(mapper, PortabilityResultNotification.class))
                     .to("{{app.wiremock.base-url}}/receptor/portability-result"
                             + "?httpMethod=POST&bridgeEndpoint=true&skipControlHeaders=true"

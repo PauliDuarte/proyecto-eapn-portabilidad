@@ -49,7 +49,7 @@ import static com.github.tomakehurst.wiremock.client.WireMock.*;
 
 @CamelSpringBootTest
 @SpringBootTest(webEnvironment = SpringBootTest.WebEnvironment.RANDOM_PORT,
-        properties = "camel.springboot.main-run-controller=false")
+        properties = {"camel.springboot.main-run-controller=false", "app.messaging.enabled=false"})
 @DirtiesContext(classMode = DirtiesContext.ClassMode.AFTER_CLASS)
 class PortabilityRouteTest {
 
