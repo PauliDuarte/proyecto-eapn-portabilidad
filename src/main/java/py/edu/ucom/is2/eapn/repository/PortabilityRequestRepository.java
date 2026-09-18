@@ -95,6 +95,27 @@ public class PortabilityRequestRepository {
                 .addValue("fechaPinConfirmado", confirmado, Types.TIMESTAMP_WITH_TIMEZONE));
     }
 
+    /** Una sola escritura evita guardar el PIN y su estado parcialmente. */
+    public int updatePinAndState(String id, String pin, OffsetDateTime expiracion,
+            OffsetDateTime generado, PortabilityStatus estado) {
+        return jdbc.update("""
+                UPDATE portability_request
+                SET pin = :pin, pin_expiracion = :pinExpiracion,
+                    fecha_pin_generado = :fechaPinGenerado, estado = :estado
+                WHERE id = :id
+                """, new MapSqlParameterSource("id", id)
+                .addValue("pin", pin, Types.VARCHAR)
+                .addValue("pinExpiracion", expiracion, Types.TIMESTAMP_WITH_TIMEZONE)
+                .addValue("fechaPinGenerado", generado, Types.TIMESTAMP_WITH_TIMEZONE)
+                .addValue("estado", estado.name()));
+    }
+
+    /** Registra el motivo sin cambiar el estado ni las fechas de la solicitud. */
+    public int updateFailureReason(String id, String motivo) {
+        return jdbc.update("UPDATE portability_request SET motivo_rechazo = :motivo WHERE id = :id",
+                new MapSqlParameterSource("id", id).addValue("motivo", motivo, Types.VARCHAR));
+    }
+
     /** Permite una fecha nula si se registra un rechazo sin portación completada. */
     public int updateCompletion(String id, OffsetDateTime completada, String motivoRechazo) {
         return jdbc.update("""

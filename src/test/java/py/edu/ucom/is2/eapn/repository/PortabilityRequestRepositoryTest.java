@@ -248,6 +248,34 @@ class PortabilityRequestRepositoryTest {
                 """);
     }
 
+    @Test
+    void updatesPinAndStateInOneStatement() {
+        when(jdbc.update(anyString(), any(MapSqlParameterSource.class))).thenReturn(1);
+        assertThat(repository.updatePinAndState("req-1", "000042", EXPIRES, GENERATED,
+                PortabilityStatus.PIN_GENERATED)).isEqualTo(1);
+        var params = captureUpdate("""
+                UPDATE portability_request
+                SET pin = :pin, pin_expiracion = :pinExpiracion,
+                    fecha_pin_generado = :fechaPinGenerado, estado = :estado
+                WHERE id = :id
+                """);
+        assertThat(params.getValues()).hasSize(5).containsEntry("pin", "000042")
+                .containsEntry("pinExpiracion", EXPIRES).containsEntry("fechaPinGenerado", GENERATED)
+                .containsEntry("estado", "PIN_GENERATED");
+        assertThat(params.getSqlType("pinExpiracion")).isEqualTo(Types.TIMESTAMP_WITH_TIMEZONE);
+        assertThat(params.getSqlType("fechaPinGenerado")).isEqualTo(Types.TIMESTAMP_WITH_TIMEZONE);
+    }
+
+    @Test
+    void recordsFailureReasonWithoutChangingOtherColumns() {
+        when(jdbc.update(anyString(), any(MapSqlParameterSource.class))).thenReturn(1);
+        assertThat(repository.updateFailureReason("req-1", "El operador donante devolvió HTTP 503."))
+                .isEqualTo(1);
+        var params = captureUpdate("UPDATE portability_request SET motivo_rechazo = :motivo WHERE id = :id");
+        assertThat(params.getValues()).hasSize(2)
+                .containsEntry("motivo", "El operador donante devolvió HTTP 503.");
+    }
+
     private MapSqlParameterSource captureUpdate(String expectedSql) {
         var sql = ArgumentCaptor.forClass(String.class);
         var params = ArgumentCaptor.forClass(MapSqlParameterSource.class);

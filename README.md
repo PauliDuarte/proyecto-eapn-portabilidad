@@ -2,7 +2,7 @@
 
 Proyecto universitario: base técnica del Desafío 1, integrador de una EAPN de
 Portabilidad Numérica en Paraguay. Incluye la recepción REST, validación inicial
-y persistencia PostgreSQL de solicitudes con estado `CREATED`.
+y persistencia PostgreSQL, generación de PIN y notificación al operador donante.
 
 **Stack:** Java 21, Gradle Wrapper 9.6.0, Spring Boot 3.5.16, Apache Camel 4.18.3
 (Java DSL), JMS con Apache ActiveMQ Artemis 2.44.0, PostgreSQL 17.6,
@@ -19,7 +19,7 @@ docker compose up -d
 Desarrollo local: PostgreSQL en `localhost:5432`, base `eapn`; Artemis JMS en
 `localhost:61616` y consola en `http://localhost:8161`. Ambos usan usuario `eapn`
 y contraseña `eapn_dev` (solo desarrollo). WireMock: `http://localhost:8081`;
-los mappings se colocarán en `wiremock/mappings/`.
+los mappings de notificación están en `wiremock/mappings/`.
 
 Configuración por entorno: `DB_URL`, `DB_USER`, `DB_PASSWORD`,
 `ARTEMIS_BROKER_URL`, `ARTEMIS_USER`, `ARTEMIS_PASSWORD`, `WIREMOCK_BASE_URL`
@@ -49,10 +49,53 @@ espacios exteriores, y donante/receptor deben ser distintos.
 
 Devuelve HTTP 201 con `id`, `msisdn`, `operador_donante`, `operador_receptor`,
 `estado` y `fecha_creacion` en ISO 8601. El ID es `REQ-YYYYMMDD-<UUID v4 sin guiones>`:
-fecha en `APP_TIMEZONE` y sufijo de 32 caracteres hexadecimales. Se guarda `CREATED`,
-cero intentos, y PIN y demás fechas nulos.
+fecha en `APP_TIMEZONE` y sufijo de 32 caracteres hexadecimales. Primero se guarda
+`CREATED` con cero intentos y PIN/fechas posteriores nulos; luego continúa el flujo
+de PIN. El HTTP 201 devuelve `estado: PIN_GENERATED` únicamente después de recibir
+la confirmación de envío del donante. La respuesta pública nunca incluye el PIN.
 
 Errores de validación o JSON devuelven HTTP 400 con
 `{"estado":"RECHAZADA","mensaje":"..."}`, sin insertar. Un error de persistencia
 devuelve HTTP 500; no se informa como rechazo de negocio ni como creación exitosa.
 Los tests de servicio y HTTP usan mocks de persistencia, sin infraestructura externa.
+
+## Generación y envío de PIN
+
+`PinGenerationService` genera seis dígitos con `SecureRandom` (incluye ceros
+iniciales). Usa el `Clock` configurado: `fecha_pin_generado = now` y
+`pin_expiracion = now + 15 minutos`. PIN, fechas y `PIN_GENERATED` se guardan
+en una sola actualización SQL antes de llamar al donante.
+
+Camel delega la integración a `direct:enviar-pin-operador`, que hace
+`POST ${WIREMOCK_BASE_URL}/operador/pin-notification` (base local:
+`http://localhost:8081`). Envía el header `X-Operador-Donante` con uno de:
+`Tigo`, `Personal`, `Claro`, `Vox`, y el JSON interno:
+
+```json
+{
+  "request_id": "REQ-20260918-0123456789abcdef0123456789abcdef",
+  "msisdn": "+595971234567",
+  "documento_titular": "0012345",
+  "pin": "000042"
+}
+```
+
+Cada mapping responde HTTP 200 con el mismo `request_id`, `estado: PIN_ENVIADO`
+y `mensaje: PIN enviado al titular`. La ruta comprueba la correlación y el estado;
+no espera que el donante devuelva el PIN. Los mappings usan el transformer local
+`response-template` para copiar `request_id` ([documentación de WireMock](https://wiremock.org/docs/response-templating/)).
+Si WireMock ya estaba iniciado al agregar los mappings, ejecutar
+`docker compose restart wiremock` para cargarlos.
+
+Si el donante devuelve error HTTP, falla la conexión o la confirmación es inválida,
+la API responde HTTP 502 con `estado: ERROR` y un mensaje con el ID de solicitud.
+La solicitud conserva `PIN_GENERATED`: indica generación, no garantía de entrega.
+El motivo técnico se guarda en `motivo_rechazo` (campo disponible en el esquema)
+y se registra junto con ID/donante, sin PIN ni cuerpos HTTP. No representa un
+rechazo final de portabilidad y no cambia `fecha_completada` ni avanza otros estados.
+Si no se puede guardar el motivo, se devuelve error de persistencia, no éxito.
+No hay reintentos automáticos ni DLC en esta etapa; la excepción de integración
+queda separada para incorporar esa política posteriormente.
+
+Los tests HTTP arrancan WireMock en la JVM con puerto aleatorio y cargan los
+cuatro mappings del repositorio. No necesitan Docker, PostgreSQL ni Artemis.

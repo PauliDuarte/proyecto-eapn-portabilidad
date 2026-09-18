@@ -1,0 +1,46 @@
+{
+  "name": "Notificación PIN - Claro",
+  "request": {
+    "method": "POST",
+    "urlPath": "/operador/pin-notification",
+    "headers": {
+      "X-Operador-Donante": {
+        "equalTo": "Claro"
+      },
+      "Content-Type": {
+        "contains": "application/json"
+      }
+    },
+    "bodyPatterns": [
+      {
+        "matchesJsonPath": "$.request_id"
+      },
+      {
+        "matchesJsonPath": "$.msisdn"
+      },
+      {
+        "matchesJsonPath": "$.documento_titular"
+      },
+      {
+        "matchesJsonPath": {
+          "expression": "$.pin",
+          "matches": "[0-9]{6}"
+        }
+      }
+    ]
+  },
+  "response": {
+    "status": 200,
+    "headers": {
+      "Content-Type": "application/json"
+    },
+    "jsonBody": {
+      "request_id": "{{jsonPath request.body '$.request_id'}}",
+      "estado": "PIN_ENVIADO",
+      "mensaje": "PIN enviado al titular"
+    },
+    "transformers": [
+      "response-template"
+    ]
+  }
+}
