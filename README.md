@@ -1,39 +1,185 @@
 # proyecto-eapn-portabilidad
 
-Proyecto universitario: base técnica del Desafío 1, integrador de una EAPN de
-Portabilidad Numérica en Paraguay. Incluye la recepción REST, validación inicial
-y persistencia PostgreSQL, generación de PIN, notificación al operador donante
-y confirmación del PIN por el titular, decisión del operador donante,
-registro del número portado y notificación final al receptor mediante colas Artemis,
-idempotencia persistente, eventos de estado y Dead Letter Channel.
+## Integrantes
 
-**Stack:** Java 21, Gradle Wrapper 9.6.0, Spring Boot 3.5.16, Apache Camel 4.18.3
-(Java DSL), JMS con Apache ActiveMQ Artemis 2.44.0, PostgreSQL 17.6,
-WireMock 3.13.1 y Docker Compose.
+- Ana Paula Duarte
+- Steven Gracia Ayala
 
-Requisitos: JDK 21 y Docker con Compose. No hace falta instalar Gradle global.
+## Descripción general
 
-```sh
-docker compose up -d
-./gradlew test
-./gradlew bootRun
+Proyecto universitario del Desafío 1: integrador de una EAPN de Portabilidad
+Numérica en Paraguay. Implementa un sistema simplificado que registra solicitudes,
+valida sus datos, genera y confirma un PIN, consulta la decisión del operador
+donante y registra la portación aprobada. Notifica al receptor el resultado del
+donante y permite consultar el estado y los hitos de la solicitud.
+
+La integración usa **Java 21, Apache Camel con Java DSL y Spring Boot, Apache
+ActiveMQ Artemis mediante JMS, PostgreSQL, WireMock, Gradle Wrapper y Docker Compose**.
+Los operadores son simulados: no hay conexión a redes de telefonía ni envío real de SMS.
+
+| Componente | Versión configurada |
+| --- | --- |
+| Java Toolchain | 21 |
+| Gradle Wrapper | 9.6.0 |
+| Spring Boot | 3.5.16 |
+| Apache Camel | 4.18.3 |
+| Artemis en Docker | 2.44.0-alpine (`apache/activemq-artemis`) |
+| PostgreSQL en Docker | 17.6 |
+| WireMock | 3.13.1 |
+
+Fuentes de configuración: [build.gradle](build.gradle),
+[Gradle Wrapper](gradle/wrapper/gradle-wrapper.properties),
+[compose.yaml](compose.yaml) y [application.properties](src/main/resources/application.properties).
+
+## Arquitectura de integración
+
+La API conserva un contrato síncrono: espera la respuesta del consumidor JMS.
+Las tres llamadas a operadores pasan por Artemis. Los servicios validan y
+persisten; las rutas Camel adaptan HTTP, JMS y los contratos de los mocks.
+
+```mermaid
+flowchart TD
+    client["Cliente / Operador receptor"]
+    post["POST /portabilidad · Camel REST DSL"]
+    validation["PortabilityService · Validación"]
+    created["Persistir CREATED"]
+    pin["PinGenerationService · SecureRandom · 6 dígitos"]
+    generated["Persistir PIN_GENERATED · Vigencia 15 minutos"]
+    confirm["POST /portabilidad/{id}/pin/confirmar · Camel REST DSL"]
+    check["PinConfirmationService · Comparar PIN y vigencia"]
+    confirmed["Persistir CONFIRMED"]
+    pending["DonorApprovalService · Persistir PENDING_DONOR"]
+    decision{"Respuesta válida del donante"}
+    approved["Persistir APPROVED"]
+    rejected["Persistir REJECTED y motivo del donante"]
+    badpin["REJECTED · PIN incorrecto o expirado"]
+    atomic["Transacción JDBC: insertar ported_number y marcar COMPLETED"]
+    completed["COMPLETED · fecha_completada"]
+    query["GET /portabilidad/{id} · Camel REST DSL · QueryService"]
+
+    subgraph broker["Apache ActiveMQ Artemis"]
+        qpin["Queue: eapn.pin.notification"]
+        qdonor["Queue: eapn.donor.approval"]
+        qreceiver["Queue: eapn.receiver.notification"]
+        topic["Topic: eapn.state.events"]
+        errors["Queue: eapn.error"]
+    end
+
+    subgraph consumers["Consumidores Camel · Idempotent Receiver"]
+        cpin["Consumidor PIN + Content-Based Router donante"]
+        cdonor["Consumidor aprobación + Content-Based Router donante"]
+        creceiver["Consumidor resultado + Content-Based Router receptor"]
+    end
+
+    subgraph db["PostgreSQL"]
+        requests[("portability_request")]
+        processed[("processed_message")]
+        ported[("ported_number")]
+    end
+
+    subgraph mocks["WireMock · Tigo / Personal / Claro / Vox"]
+        wpin["Donante · POST /operador/pin-notification"]
+        wdonor["Donante · POST /operador/portability-approval"]
+        wreceiver["Receptor · POST /receptor/portability-result"]
+    end
+
+    client --> post --> validation --> created --> pin --> generated --> qpin
+    created -.-> requests
+    qpin --> cpin --> wpin
+    wpin -. "PIN_ENVIADO · Reply por JMS · HTTP 201" .-> client
+    client --> confirm --> check
+    check -->|Correcto y vigente| confirmed --> pending --> qdonor
+    check -->|Incorrecto o expirado| badpin
+    qdonor --> cdonor --> wdonor
+    wdonor -. "APPROVED / REJECTED · Reply por JMS" .-> decision
+    decision -->|APPROVED| approved --> atomic --> completed
+    decision -->|REJECTED| rejected
+    atomic -.-> ported
+    atomic -.-> requests
+    completed --> qreceiver
+    rejected --> qreceiver
+    qreceiver --> creceiver --> wreceiver
+    wreceiver -. "RECIBIDO · Reply por JMS · HTTP 200 final" .-> client
+    client --> query --> requests
+
+    cpin -. "Clave y respuesta" .-> processed
+    cdonor -. "Clave y respuesta" .-> processed
+    creceiver -. "Clave y respuesta" .-> processed
+    tap["StateEventPublisher + Wire Tap · Cambios persistidos"]
+    generated -.-> tap
+    created -.-> tap
+    confirmed -.-> tap
+    approved -.-> tap
+    rejected -.-> tap
+    badpin -.-> tap
+    completed -.-> tap
+    tap --> topic
+    dlc["Dead Letter Channel · Fallo técnico tras 3 intentos"]
+    cpin -.-> dlc
+    cdonor -.-> dlc
+    creceiver -.-> dlc
+    dlc --> errors
 ```
 
-Desarrollo local: PostgreSQL en `localhost:5432`, base `eapn`; Artemis JMS en
-`localhost:61616` y consola en `http://localhost:8161`. Ambos usan usuario `eapn`
-y contraseña `eapn_dev` (solo desarrollo). WireMock: `http://localhost:8081`;
-los mappings de notificación y aprobación están en `wiremock/mappings/`.
+Las transiciones se guardan en `portability_request`; las líneas hacia la base
+resumen las escrituras para mantener legible el diagrama. La confirmación es una
+**segunda petición del cliente**: WireMock confirma el envío simulado, pero no
+confirma el PIN en nombre del titular. El rechazo por PIN termina esa petición
+con HTTP 400; la notificación final al receptor pertenece al flujo de decisión
+del donante. La llamada externa al receptor ocurre después del commit JDBC.
 
-Configuración por entorno: `DB_URL`, `DB_USER`, `DB_PASSWORD`,
-`ARTEMIS_BROKER_URL`, `ARTEMIS_USER`, `ARTEMIS_PASSWORD`, `WIREMOCK_BASE_URL`
-y `APP_TIMEZONE` (por defecto `America/Asuncion`). Exportar las variables para
-compartirlas entre Compose y `bootRun`; Spring Boot no lee `.env` automáticamente.
-El SQL inicial se ejecuta solo al crear un volumen PostgreSQL vacío.
-El test de contexto usa mocks de JDBC/JMS y no necesita contenedores.
+## EIPs implementados
 
-## Recepción de solicitudes
+| Patrón | Problema que resuelve | Dónde se aplica | Justificación |
+| --- | --- | --- | --- |
+| Content-Based Router | Seleccionar el operador destinatario | `OperatorRouter`, rutas `direct:seleccionar-donante` y `direct:seleccionar-receptor` | `choice/when` reconoce Tigo, Personal, Claro y Vox y establece el header del rol correspondiente. |
+| Request-Reply | Esperar y validar la confirmación o decisión externa | `MessagingGatewayRoute`, consumidores JMS y adaptadores HTTP | La API espera un `OperatorReply`; el donante responde APPROVED/REJECTED con correlación validada. |
+| Correlation Identifier | Asociar respuestas y diagnósticos a una solicitud | `JMSCorrelationID = request_id`, DTOs y validaciones de consumidores/HTTP | Evita aplicar una respuesta que corresponde a otra solicitud. |
+| Idempotent Receiver | Evitar repetir integraciones por mensajes duplicados | `OperatorMessageProcessor` y `ProcessedMessageRepository` | La clave persistente por operación y solicitud permite reutilizar una respuesta ya procesada. |
+| Dead Letter Channel | Aislar fallos técnicos después de reintentos limitados | `MessagingConsumerRoute` → `direct:messaging-error` → `eapn.error` | Conserva diagnóstico seguro sin convertir un error técnico en rechazo de negocio. |
+| Wire Tap | Observar cambios de estado sin esperar a suscriptores de auditoría | `StateEventPublisher`, `direct:publish-state-event` y `direct:deliver-state-event` | Envía una copia de un DTO seguro al topic, sin copiar el modelo que contiene PIN. |
+| Message Channel / JMS | Transportar trabajo entre la API y consumidores | Tres colas de operaciones, topic de estados y cola de errores | Artemis interviene en el procesamiento real de las llamadas a operadores. |
 
-`POST http://localhost:8080/portabilidad`, con `Content-Type: application/json`:
+Implementaciones en [route/](src/main/java/py/edu/ucom/is2/eapn/route/),
+[messaging/](src/main/java/py/edu/ucom/is2/eapn/messaging/) y
+[repository/](src/main/java/py/edu/ucom/is2/eapn/repository/).
+
+## Flujo de estados
+
+```mermaid
+stateDiagram-v2
+    [*] --> CREATED
+    CREATED --> PIN_GENERATED: PIN guardado con expiración
+    PIN_GENERATED --> CONFIRMED: PIN correcto y vigente
+    PIN_GENERATED --> REJECTED: PIN incorrecto o expirado
+    CONFIRMED --> PENDING_DONOR: Consultar al donante
+    PENDING_DONOR --> APPROVED: Donante aprueba
+    PENDING_DONOR --> REJECTED: Donante rechaza con motivo
+    APPROVED --> COMPLETED: Número portado y solicitud actualizados atómicamente
+    COMPLETED --> [*]
+    REJECTED --> [*]
+```
+
+- `PIN_GENERATED` significa que el PIN fue generado y almacenado; no garantiza
+  entrega si la integración falla. El PIN tiene seis dígitos, admite ceros iniciales
+  y expira a los 15 minutos; `now >= pinExpiracion` se considera expirado.
+- Solo `PIN_GENERATED` admite confirmación. Un intento con formato válido y una
+  solicitud habilitada incrementa el contador, tanto si confirma como si rechaza.
+  PIN malformado o estado incompatible no incrementan intentos.
+- Un rechazo del donante conserva su motivo, no inserta `ported_number` y no marca
+  COMPLETED. Tanto esa decisión como una portabilidad completada se notifican al receptor.
+- Un error técnico no es `REJECTED`: al fallar la aprobación se conserva
+  `PENDING_DONOR`; si falla la notificación final se conserva `COMPLETED` o `REJECTED`.
+  Un fallo de persistencia al finalizar conserva `APPROVED` mediante rollback.
+
+## Endpoints
+
+Base local: `http://localhost:8080`. Los POST reciben `Content-Type: application/json`.
+Los ejemplos usan datos ilustrativos; reemplazar `{id}` por el ID devuelto al crear.
+
+### POST /portabilidad
+
+Request:
 
 ```json
 {
@@ -44,367 +190,330 @@ El test de contexto usa mocks de JDBC/JMS y no necesita contenedores.
 }
 ```
 
-El MSISDN debe tener `+5959` y ocho dígitos adicionales, sin espacios ni guiones
-(validación de formato móvil, no de existencia del número). Documento obligatorio,
-hasta 50 caracteres según el esquema; se recortan espacios exteriores.
-Operadores permitidos: Tigo, Personal, Claro y Vox; se normalizan mayúsculas y
-espacios exteriores, y donante/receptor deben ser distintos.
-
-Devuelve HTTP 201 con `id`, `msisdn`, `operador_donante`, `operador_receptor`,
-`estado` y `fecha_creacion` en ISO 8601. El ID es `REQ-YYYYMMDD-<UUID v4 sin guiones>`:
-fecha en `APP_TIMEZONE` y sufijo de 32 caracteres hexadecimales. Primero se guarda
-`CREATED` con cero intentos y PIN/fechas posteriores nulos; luego continúa el flujo
-de PIN. El HTTP 201 devuelve `estado: PIN_GENERATED` únicamente después de recibir
-la confirmación de envío del donante. La respuesta pública nunca incluye el PIN.
-
-Errores de validación o JSON devuelven HTTP 400 con
-`{"estado":"RECHAZADA","mensaje":"..."}`, sin insertar. Un error de persistencia
-devuelve HTTP 500; no se informa como rechazo de negocio ni como creación exitosa.
-Los tests de servicio y HTTP usan mocks de persistencia, sin infraestructura externa.
-
-## Consulta de portabilidad
-
-`GET http://localhost:8080/portabilidad/{id}` consulta el estado persistido mediante
-Camel REST DSL → `PortabilityQueryService` → `PortabilityRequestRepository.findById`.
-No modifica la solicitud ni envía mensajes a operadores.
-
-HTTP 200 devuelve un DTO público con `id`, `msisdn`, `operador_donante`,
-`operador_receptor`, `estado`, `fecha_creacion`, `fecha_pin_generado`,
-`fecha_pin_confirmado` y `fecha_completada`. Las fechas son ISO 8601; los hitos
-no alcanzados conservan `null`. En estado `REJECTED` se incluye `motivo_rechazo`
-si está disponible. Un motivo técnico de entrega de PIN no se publica como rechazo.
-No se devuelven PIN, expiración, documento, intentos ni datos internos JMS.
-
-Una solicitud inexistente devuelve HTTP 404 con
-`{"estado":"RECHAZADA","mensaje":"La solicitud de portabilidad no existe."}`.
-Un fallo técnico devuelve HTTP 500 con
-`{"estado":"ERROR","mensaje":"No se pudo consultar la solicitud."}`,
-sin detalles de la excepción. La consulta permite observar también estados
-transitorios como CONFIRMED, PENDING_DONOR y APPROVED.
-
-## Generación y envío de PIN
-
-`PinGenerationService` genera seis dígitos con `SecureRandom` (incluye ceros
-iniciales). Usa el `Clock` configurado: `fecha_pin_generado = now` y
-`pin_expiracion = now + 15 minutos`. PIN, fechas y `PIN_GENERATED` se guardan
-en una sola actualización SQL antes de llamar al donante.
-
-Camel delega la integración a `direct:enviar-pin-operador`, que hace
-`POST ${WIREMOCK_BASE_URL}/operador/pin-notification` (base local:
-`http://localhost:8081`). Envía el header `X-Operador-Donante` con uno de:
-`Tigo`, `Personal`, `Claro`, `Vox`, y el JSON interno:
+Respuesta **HTTP 201**, después de confirmar el envío simulado del PIN:
 
 ```json
 {
-  "request_id": "REQ-20260918-0123456789abcdef0123456789abcdef",
+  "id": "REQ-20260918-0123456789abcdef0123456789abcdef",
   "msisdn": "+595971234567",
-  "documento_titular": "0012345",
-  "pin": "000042"
-}
-```
-
-Cada mapping responde HTTP 200 con el mismo `request_id`, `estado: PIN_ENVIADO`
-y `mensaje: PIN enviado al titular`. La ruta comprueba la correlación y el estado;
-no espera que el donante devuelva el PIN. Los mappings usan el transformer local
-`response-template` para copiar `request_id` ([documentación de WireMock](https://wiremock.org/docs/response-templating/)).
-Si WireMock ya estaba iniciado al agregar los mappings, ejecutar
-`docker compose restart wiremock` para cargarlos.
-
-Si el donante devuelve error HTTP, falla la conexión o la confirmación es inválida,
-la API responde HTTP 502 con `estado: ERROR` y un mensaje con el ID de solicitud.
-La solicitud conserva `PIN_GENERATED`: indica generación, no garantía de entrega.
-El motivo técnico se guarda en `motivo_rechazo` (campo disponible en el esquema)
-y se registra junto con ID/donante, sin PIN ni cuerpos HTTP. No representa un
-rechazo final de portabilidad y no cambia `fecha_completada` ni avanza otros estados.
-Si no se puede guardar el motivo, se devuelve error de persistencia, no éxito.
-La entrega pasa por Artemis y aplica tres intentos totales; al agotarse, el
-consumidor publica un diagnóstico seguro en `eapn.error` (ver Mensajería).
-
-Los tests HTTP arrancan WireMock en la JVM con puerto aleatorio y cargan los
-mappings del repositorio. No necesitan Docker, PostgreSQL ni Artemis.
-
-## Confirmación del PIN
-
-`POST http://localhost:8080/portabilidad/{id}/pin/confirmar`, con
-`Content-Type: application/json` y body `{"pin":"000042"}`.
-
-Solo se aceptan solicitudes existentes en `PIN_GENERATED`, con PIN almacenado,
-fecha de generación y expiración. El PIN recibido debe ser texto con exactamente
-seis dígitos ASCII, sin recortar espacios (se preservan ceros iniciales).
-La comparación temporal usa el `Clock` configurado y `OffsetDateTime`:
-`now >= pinExpiracion` se considera expirado, incluyendo el instante exacto.
-Si además es incorrecto, prevalece el motivo de expiración.
-
-Un PIN correcto y vigente guarda `CONFIRMED` y `fecha_pin_confirmado = now`,
-limpia cualquier motivo técnico anterior y continúa inmediatamente con la consulta
-al donante. Después de persistir el resultado y confirmar su notificación al
-receptor, la respuesta HTTP 200 refleja el estado final, por ejemplo:
-
-```json
-{"id":"REQ-...","estado":"COMPLETED","mensaje":"Portabilidad completada correctamente"}
-```
-
-Un PIN incorrecto o expirado guarda `REJECTED` y su motivo específico, sin marcar
-`fecha_completada`. Cada intento evaluable (formato válido sobre una solicitud
-habilitada con datos de PIN) incrementa `intentos_confirmacion` en uno, tanto
-si confirma como si rechaza. Incremento y resultado se persisten juntos mediante
-un único UPDATE condicionado a `PIN_GENERATED`. JSON/PIN malformado, solicitud
-inexistente, estado incompatible o datos de PIN ausentes no incrementan intentos
-ni modifican la solicitud. Una segunda confirmación de `CONFIRMED` o `REJECTED`
-devuelve conflicto; la idempotencia JMS no modifica este contrato HTTP ni agrega
-un límite de intentos de confirmación.
-
-| HTTP | Resultado |
-| --- | --- |
-| 200 | Resultado final COMPLETED o REJECTED, notificado al receptor |
-| 400 | JSON/PIN malformado, PIN incorrecto o expirado |
-| 404 | Solicitud inexistente |
-| 409 | Estado incompatible, PIN generado incompleto o cambio concurrente de estado |
-| 500 | Error de persistencia o procesamiento |
-| 502 | Error de integración: conserva PENDING_DONOR si falla la consulta al donante, o COMPLETED/REJECTED si falla la notificación final |
-
-Los errores 400/404/409 conservan el formato
-`{"estado":"RECHAZADA","mensaje":"..."}`. Ese estado describe la respuesta;
-en la validación del PIN, solo uno incorrecto o expirado cambia la solicitud a `REJECTED`.
-Los errores 500/502 usan `estado: ERROR`. Ninguna respuesta incluye el PIN.
-Los tests de confirmación usan reloj fijo, repository simulado y WireMock embebido.
-
-## Decisión del operador donante
-
-Flujo después del PIN correcto:
-
-```text
-CONFIRMED → PENDING_DONOR → APPROVED → COMPLETED → notificar receptor
-                         → REJECTED (con motivo) → notificar receptor
-```
-
-`DonorApprovalService` persiste `PENDING_DONOR` antes de hacer la consulta.
-Camel utiliza `direct:solicitar-aprobacion-donante` para enviar
-`POST ${WIREMOCK_BASE_URL}/operador/portability-approval` con
-`X-Operador-Donante: Tigo|Personal|Claro|Vox` y estos campos:
-
-```json
-{
-  "request_id": "REQ-...",
-  "msisdn": "+595971234567",
-  "documento_titular": "12345",
-  "operador_receptor": "Personal"
-}
-```
-
-La respuesta debe ser HTTP 200, JSON válido y contener el mismo `request_id`,
-`estado` exactamente `APPROVED` o `REJECTED`, y un `motivo` no vacío si rechaza.
-Una decisión válida se persiste mediante un UPDATE condicionado a `PENDING_DONOR`.
-El rechazo de negocio guarda su motivo en `motivo_rechazo` y notifica al receptor.
-Si la notificación se confirma, devuelve HTTP 200 con `estado: REJECTED` y ese
-motivo en `mensaje`.
-
-Los cuatro mappings normales responden `APPROVED` con `motivo: null`.
-Para simular un rechazo con cualquier donante, crear la solicitud usando
-`documento_titular: TEST-REJECTED`: el mapping de mayor prioridad responde
-`REJECTED` con `Datos del titular no coinciden`. Es una regla exclusiva del mock;
-no hay un caso especial para ese documento en el código de negocio.
-
-Errores HTTP, falta de respuesta, timeout, JSON inválido, correlación incorrecta,
-estado desconocido o rechazo sin motivo devuelven HTTP 502. La solicitud queda
-en `PENDING_DONOR`, sin guardar una decisión de negocio ni un motivo de rechazo.
-El motivo técnico se registra en logs junto con ID/donante, sin cuerpos HTTP.
-El timeout de respuesta se configura con `DONOR_APPROVAL_RESPONSE_TIMEOUT_MS`
-(por defecto 5000 ms). El consumidor JMS aplica la política de redelivery/DLC
-descrita abajo; un error técnico nunca equivale a una decisión `REJECTED`.
-
-## Finalización y notificación al receptor
-
-Después de persistir `APPROVED`, `PortabilityFinalizationService.finish()` ejecuta
-en una misma transacción JDBC (`@Transactional`):
-
-1. Insertar en `ported_number` el MSISDN, donante como `operador_anterior`, receptor
-   como `operador_actual` y `fecha_portacion` tomada del `Clock` configurado.
-2. Actualizar la solicitud de `APPROVED` a `COMPLETED` y guardar `fecha_completada`.
-
-Ambas fechas usan el mismo `OffsetDateTime`. Si falla cualquiera de las escrituras,
-se revierte la transacción: no queda un número portado parcial ni una solicitud
-completada, se conserva `APPROVED` y la API devuelve HTTP 500. Un MSISDN ya existente
-produce error de inserción; no se implementa un upsert. La deduplicación JMS
-se aplica a las operaciones externas, no a nuevas solicitudes HTTP del mismo MSISDN.
-
-Si la decisión fue `REJECTED`, se conserva ese estado y su motivo. No se inserta
-en `ported_number` ni se escribe `fecha_completada`. Para el payload de rechazo,
-`fecha_finalizacion` indica cuándo se preparó el resultado, no una fecha de portación.
-
-Al retornar del servicio, la transacción ya finalizó. Entonces Camel llama a
-`direct:notificar-resultado-receptor`, que realiza
-`POST ${WIREMOCK_BASE_URL}/receptor/portability-result` con
-`X-Operador-Receptor: Tigo|Personal|Claro|Vox`, sin reenviar `X-Operador-Donante`.
-El DTO final tiene únicamente estos campos (no incluye PIN ni documento):
-
-```json
-{
-  "request_id": "REQ-...",
-  "msisdn": "+595971234567",
-  "estado": "COMPLETED",
   "operador_donante": "Tigo",
   "operador_receptor": "Personal",
-  "fecha_finalizacion": "2026-09-18T10:00:00-03:00",
-  "motivo": null
+  "estado": "PIN_GENERATED",
+  "fecha_creacion": "2026-09-18T10:00:00-03:00"
 }
 ```
 
-Para rechazo usa `estado: REJECTED` y el motivo del donante. Los cuatro mappings
-`wiremock/mappings/portability-result-*.json` pertenecen a este proyecto EAPN,
-distinguen el receptor y devuelven HTTP 200 con el mismo `request_id` y
-`estado: RECIBIDO`. La ruta verifica ambos valores.
+Se valida formato móvil `+5959` seguido de ocho dígitos; no se verifica la
+existencia del número. El documento no puede estar vacío y admite hasta 50
+caracteres después de quitar espacios exteriores. Los operadores deben estar
+registrados en la lista de cuatro nombres y ser distintos; se normaliza su escritura.
+El ID usa `REQ-YYYYMMDD-<UUID v4 sin guiones>`, con fecha del Clock configurado.
 
-Si falla la entrega o la confirmación del receptor, se devuelve HTTP 502 con
-`estado: ERROR` y un mensaje que identifica la solicitud y su estado conservado.
-La portabilidad permanece `COMPLETED`, o `REJECTED` con su motivo intacto.
-El fallo técnico se registra en logs con ID, receptor y estado, sin modificar
-datos de negocio ni registrar PIN o cuerpos HTTP. La llamada externa ocurre
-fuera de la transacción de base de datos. El consumidor JMS reintenta la
-notificación y usa el DLC si se agotan los intentos.
-El timeout se configura con `RECEIVER_NOTIFICATION_RESPONSE_TIMEOUT_MS` (5000 ms
-por defecto).
+### POST /portabilidad/{id}/pin/confirmar
 
-Los tests verifican los cuatro receptores, el payload sin PIN, la correlación,
-los errores de entrega y el envío posterior al commit. Las pruebas transaccionales
-usan el proxy Spring y el gestor JDBC real con una conexión simulada para comprobar
-commit y rollback, sin PostgreSQL externo. Reiniciar WireMock si estaba activo
-antes de agregar los mappings: `docker compose restart wiremock`.
+Request de ejemplo; debe usarse el PIN correspondiente a la solicitud:
 
+```json
+{"pin":"000042"}
+```
+
+Respuesta **HTTP 200** cuando finalizan la portación y la notificación:
+
+```json
+{"id":"REQ-20260918-0123456789abcdef0123456789abcdef","estado":"COMPLETED","mensaje":"Portabilidad completada correctamente"}
+```
+
+Si el donante rechaza y el receptor confirma la notificación, devuelve **HTTP 200**:
+
+```json
+{"id":"REQ-20260918-0123456789abcdef0123456789abcdef","estado":"REJECTED","mensaje":"Datos del titular no coinciden"}
+```
+
+El PIN solo se recibe en el request: **ninguna respuesta pública lo devuelve**.
+WireMock no envía SMS; para una demostración local el PIN se obtiene del registro
+de prueba en PostgreSQL, no de un endpoint público.
+
+### GET /portabilidad/{id}
+
+Request sin body: `GET /portabilidad/REQ-20260918-0123456789abcdef0123456789abcdef`.
+Respuesta **HTTP 200**:
+
+```json
+{
+  "id": "REQ-20260918-0123456789abcdef0123456789abcdef",
+  "msisdn": "+595971234567",
+  "operador_donante": "Tigo",
+  "operador_receptor": "Personal",
+  "estado": "COMPLETED",
+  "fecha_creacion": "2026-09-18T10:00:00-03:00",
+  "fecha_pin_generado": "2026-09-18T10:00:01-03:00",
+  "fecha_pin_confirmado": "2026-09-18T10:01:00-03:00",
+  "fecha_completada": "2026-09-18T10:01:01-03:00"
+}
+```
+
+Las fechas de hitos no alcanzados son `null`. Para `REJECTED` se incluye
+`motivo_rechazo` cuando existe. No se exponen PIN, expiración, documento, intentos
+ni información JMS. La consulta reutiliza `findById` y no modifica datos.
+
+### Errores HTTP
+
+| Código | Cuándo se usa |
+| --- | --- |
+| 400 | JSON o datos inválidos; PIN incorrecto o expirado |
+| 404 | Solicitud inexistente en consulta o confirmación |
+| 409 | Confirmación incompatible con el estado o datos de PIN; cambio concurrente de estado |
+| 500 | Error de persistencia o procesamiento |
+| 502 | Fallo de integración en creación o confirmación |
+
+Ejemplo de 404:
+
+```json
+{"estado":"RECHAZADA","mensaje":"La solicitud de portabilidad no existe."}
+```
+
+Ejemplo de 500 al consultar:
+
+```json
+{"estado":"ERROR","mensaje":"No se pudo consultar la solicitud."}
+```
+
+`RECHAZADA` en una respuesta de error no implica que la solicitud haya cambiado
+al estado de negocio `REJECTED`. No se persisten solicitudes de creación inválidas.
 
 ## Mensajería Artemis
 
-La API conserva sus respuestas síncronas. Las **tres integraciones HTTP pasan
-realmente por Artemis**: el gateway envía un `TextMessage` JSON y espera la respuesta
-del consumidor mediante JMS Request-Reply (cola temporal de respuesta). Generar
-el PIN y persistir los estados sigue ocurriendo en los servicios existentes.
-
-| Destino | Tipo | Trabajo del consumidor |
+| Destino | Tipo | Contenido / propósito |
 | --- | --- | --- |
-| `eapn.pin.notification` | Queue | Entregar el PIN ya generado al donante |
-| `eapn.donor.approval` | Queue | Solicitar y validar APPROVED/REJECTED |
-| `eapn.receiver.notification` | Queue | Notificar COMPLETED/REJECTED al receptor |
-| `eapn.state.events` | Topic | Publicación para suscriptores de auditoría |
-| `eapn.error` | Queue | Diagnóstico técnico tras agotar los reintentos |
+| `eapn.pin.notification` | Cola | Solicitar entrega del PIN generado al donante |
+| `eapn.donor.approval` | Cola | Solicitar decisión de portabilidad al donante |
+| `eapn.receiver.notification` | Cola | Notificar COMPLETED/REJECTED al receptor |
+| `eapn.state.events` | Topic | Publicar cambios de estado para suscriptores de auditoría |
+| `eapn.error` | Cola | Conservar diagnósticos de fallos técnicos agotados |
 
-```text
-REST crear → CREATED → PIN_GENERATED → queue PIN → consumidor → HTTP donante
-REST confirmar → CONFIRMED → PENDING_DONOR → queue aprobación → consumidor → HTTP donante
-  APPROVED → [insert ported_number + COMPLETED, transacción JDBC]
-  REJECTED → conservar motivo
-  → queue receptor → consumidor → HTTP receptor
-Cambios persistidos → Wire Tap → topic de eventos
-Fallo técnico del consumidor → 2 redeliveries → eapn.error + respuesta técnica
-```
+Los gateways envían JSON como `TextMessage` persistente usando **Request-Reply JMS**.
+Cada comando contiene `request_id`, `msisdn`, `operation`, `operator` y `payload`.
+Se usa `JMSCorrelationID = request_id` y un header `operation`. El consumidor
+responde mediante `JMSReplyTo` a una cola temporal; el gateway valida la correlación.
+Solo el comando de entrega de PIN contiene PIN, porque el donante lo necesita.
 
-### EIPs y contratos
+El DLC aplica **tres intentos totales**: uno original y dos redeliveries, con
+200 ms de pausa. Abarca HTTP no exitoso, timeout, JSON inválido, correlación
+incorrecta, estado desconocido y excepciones del consumidor/JDBC. Los reintentos
+propios del cliente HTTP están desactivados. Un `REJECTED` válido del donante es
+una respuesta de negocio y no dispara el DLC.
 
-- **Correlation Identifier:** `JMSCorrelationID = request_id` en comandos,
-  respuestas, eventos y errores. El consumidor valida también el ID del payload.
-  Cada comando contiene `request_id`, `msisdn`, `operation`, `operator` y `payload`;
-  el header JMS `operation` identifica la operación. La respuesta vuelve por
-  `JMSReplyTo`; nunca se reenvían headers JMS al HTTP externo.
-- **Request-Reply:** `MessagingGatewayRoute` espera al consumidor; este llama a las
-  rutas HTTP existentes, valida la correlación y devuelve un `OperatorReply`.
-  El timeout JMS es `MESSAGING_REQUEST_TIMEOUT_MS` (60000 ms). Debe superar la suma
-  de los tres intentos HTTP y sus pausas; aumentarlo si se aumentan los timeouts HTTP.
-- **Content-Based Router:** `OperatorRouter` tiene `choice/when` para Tigo, Personal,
-  Claro y Vox, tanto para donante como receptor. Establece respectivamente
-  `X-Operador-Donante` o `X-Operador-Receptor`; operador desconocido es error técnico.
-- **Idempotent Receiver persistente:** `OperatorMessageProcessor` reclama la clave
-  `(operation, request_id)` en `processed_message` mediante una PK PostgreSQL.
-  Solo su propietario ejecuta el HTTP. Guarda una respuesta JSON segura y devuelve
-  esa respuesta a duplicados, sin repetir la integración. La operación forma parte
-  de la clave porque un mismo request debe pasar por las tres colas.
-- **Dead Letter Channel:** `MessagingConsumerRoute` aplica **3 intentos totales**
-  (original + 2 redeliveries), separados por 200 ms. Reintenta el procesamiento del
-  comando completo, no solamente la deserialización de la respuesta HTTP. Los
-  reintentos propios del cliente HTTP están desactivados. Incluye HTTP no 200,
-  timeout, JSON inválido, correlación incorrecta, estado desconocido y excepciones
-  del consumidor/JDBC. Un resultado `REJECTED` válido no dispara el DLC.
-- **Wire Tap:** después de persistir cada estado, `StateEventPublisher` prepara un
-  DTO seguro y `publish-state-event` desvía una copia a `deliver-state-event` sin
-  demorar el flujo HTTP. Se publican CREATED, PIN_GENERATED, CONFIRMED, APPROVED,
-  REJECTED (incluido PIN incorrecto/expirado) y COMPLETED. Los eventos contienen
-  `request_id`, `msisdn`, `estado`, `timestamp` del Clock y `operation: STATE_CHANGED`.
-  Sirven para observar la evolución sin consumir las colas de trabajo. Un suscriptor
-  debe estar conectado o usar una suscripción durable para conservar eventos cuando
-  esté desconectado; la aplicación no almacena un historial de auditoría adicional.
+Al agotarse los intentos, `eapn.error` recibe `request_id`, `origin`, `operation`,
+`summary`, `exceptionType` y `timestamp`. Se omiten cuerpos originales, PIN,
+documento, credenciales y mensajes arbitrarios de excepciones. El consumidor
+devuelve un error técnico al gateway, que responde HTTP 502. No hay reenvío
+automático desde la cola de errores.
 
-Las rutas originales `direct:enviar-pin-operador`,
-`direct:solicitar-aprobacion-donante` y `direct:notificar-resultado-receptor` son
-ahora gateways JMS; sus adaptadores HTTP tienen el sufijo `-http`. Los contratos
-WireMock siguen siendo los mismos y los mappings son exclusivamente de EAPN.
+Wire Tap publica CREATED, PIN_GENERATED, CONFIRMED, APPROVED, REJECTED —incluido
+PIN incorrecto o expirado— y COMPLETED. Cada evento tiene `request_id`, `msisdn`,
+`estado`, `timestamp` y `operation: STATE_CHANGED`, sin PIN. PENDING_DONOR se
+persiste, pero no se publica como evento en la implementación actual. Un suscriptor
+debe estar conectado o mantener una suscripción durable para conservar eventos
+cuando esté desconectado; la aplicación no agrega un historial de auditoría propio.
 
-### Errores, persistencia y recuperación
+## Idempotencia
 
-El diagnóstico de `eapn.error` incluye `request_id`, `origin`, `operation`, un
-`summary` seguro, `exceptionType` y `timestamp`; no copia el mensaje original,
-PIN, documento, credenciales ni textos arbitrarios de excepciones. Solo la cola
-PIN lleva el PIN, porque es necesario para enviarlo. Las respuestas/cache, eventos,
-cola de errores y notificación final no incluyen el PIN.
+`ProcessedMessageRepository` usa la tabla **`processed_message`**. Su clave primaria
+es `(operation, request_id)`: el mismo ID puede ejecutar las tres operaciones,
+pero no debe repetir una operación ya confirmada.
 
-Después del DLC se devuelve una respuesta técnica al gateway (HTTP 502). Se
-conserva PIN_GENERATED, PENDING_DONOR o COMPLETED/REJECTED según la etapa alcanzada.
-La inserción del número y COMPLETED continúan siendo una transacción JDBC atómica;
-ninguna espera JMS/HTTP externa forma parte de esa transacción. Si falla la
-escritura de la cache después de un HTTP exitoso, los redeliveries del mismo
-Exchange reintentan esa escritura sin repetir el HTTP.
+1. El consumidor intenta insertar la clave; la PK resuelve la exclusión entre instancias.
+2. Si obtiene la clave, llama al operador y guarda la respuesta JSON segura.
+3. Un duplicado reutiliza la respuesta guardada sin repetir el HTTP.
+4. Si otra instancia sigue trabajando, se reintenta la lectura; al agotarse los
+   intentos se informa el error sin liberar la clave del otro consumidor.
+5. Un fallo propio agotado libera únicamente la clave incompleta, después de
+   publicar el diagnóstico. Una respuesta externa exitosa se conserva en el
+   Exchange para no repetir HTTP si solo falla su escritura JDBC durante redelivery.
 
-Un duplicado con otra instancia todavía trabajando no se ejecuta: se reintenta
-la lectura de su respuesta y, si sigue pendiente, termina en error sin liberar
-la clave del otro consumidor. Tras un fallo propio agotado se libera únicamente
-la clave todavía incompleta, después de publicar el diagnóstico. No hay reenvíos
-automáticos desde `eapn.error`: corregir la causa y reconstruir el comando desde
-la solicitud persistida para un reenvío explícito a su cola. Para un PIN debe
-respetarse su vigencia; nunca generar otro PIN al repetir una entrega.
+La idempotencia cubre **consumidores JMS**, no nuevos POST del mismo número ni
+la repetición completa de la confirmación HTTP. Un cierre abrupto puede dejar
+una clave incompleta: requiere revisar el resultado externo antes de liberarla.
+No existe garantía de ejecución única distribuida entre HTTP, JMS y PostgreSQL.
 
-**Límite de consistencia:** no hay XA/outbox ni garantía de exactly-once entre
-PostgreSQL, Artemis y HTTP. Un timeout puede ocurrir después de que el operador
-haya procesado la llamada. Un cierre abrupto puede dejar una clave sin respuesta:
-requiere revisar el resultado externo antes de liberarla manualmente. No se
-elimina automáticamente para evitar duplicar un efecto incierto. Los eventos son
-asíncronos y pueden llegar fuera de orden; no reemplazan el estado PostgreSQL.
-Si Artemis no está disponible, no se puede garantizar publicar en su propia cola
-de errores; se propaga error técnico y no se inventa un rechazo de negocio. Los
-consumidores usan CLIENT_ACKNOWLEDGE y no ocultan un fallo al publicar el DLC.
-La recuperación del flujo REST tras una caída entre etapas requiere intervención;
-la deduplicación implementada cubre los consumidores JMS, no un reintento completo
-de `POST /portabilidad` o de la confirmación.
+## Persistencia
 
-### SQL y pruebas
+| Tabla | Datos y responsabilidad |
+| --- | --- |
+| `portability_request` | ID, MSISDN, documento, operadores, estado, PIN y expiración, intentos, fechas del proceso y motivo de rechazo |
+| `ported_number` | MSISDN como PK, operador anterior, operador actual y fecha de portación |
+| `processed_message` | Operación e ID como PK compuesta, respuesta procesada y fecha de creación; deduplicación JMS |
 
-Para un volumen nuevo, Compose ejecuta `docker/postgres/messaging.sql` después del
-SQL de negocio. **Si el volumen ya existe**, aplicar una vez antes de `bootRun`:
+Los repositories utilizan JDBC con parámetros. Las fechas de negocio usan
+`OffsetDateTime`, columnas PostgreSQL `TIMESTAMPTZ` y el Clock de
+`America/Asuncion` por defecto.
+
+`PortabilityFinalizationService.finish()` usa `@Transactional` para insertar el
+número portado y actualizar COMPLETED con `fecha_completada` de forma atómica.
+La notificación externa ocurre después del commit. Si falla la transacción se
+conserva APPROVED; si falla la notificación posterior, se conserva COMPLETED.
+Un MSISDN ya presente produce error de inserción; no se implementa upsert.
+
+Un fallo técnico al entregar el PIN puede guardarse en `motivo_rechazo` manteniendo
+PIN_GENERATED. El GET oculta ese motivo técnico: solo publica motivos de REJECTED.
+
+### Inicialización desde un entorno limpio
+
+[compose.yaml](compose.yaml) monta ambos scripts en `/docker-entrypoint-initdb.d/`:
+
+1. [01-init.sql](docker/postgres/init.sql): crea `portability_request` y `ported_number`.
+2. [02-messaging.sql](docker/postgres/messaging.sql): crea `processed_message`.
+
+PostgreSQL los ejecuta automáticamente al inicializar un **volumen nuevo**.
+No se requiere aplicar SQL manualmente en una instalación desde cero. Los
+volúmenes antiguos sin `processed_message` pueden actualizarse una vez con:
 
 ```sh
 docker compose exec -T postgresql sh -c 'psql -v ON_ERROR_STOP=1 -U "$POSTGRES_USER" -d "$POSTGRES_DB"' < docker/postgres/messaging.sql
-./gradlew test --rerun-tasks
 ```
 
-La migración solo agrega `processed_message`, sin cambiar tablas de negocio.
-Los 229 tests previos mantienen sus aserciones; los tests HTTP aislados establecen
-`app.messaging.enabled=false`. En ejecución normal es `true`, sin fallback
-silencioso si Artemis falla. Las nuevas pruebas usan **Artemis Jakarta 2.40.0
-embebido**, WireMock local y H2 con JDBC real; estas dos nuevas dependencias son
-exclusivas de test. Verifican transporte/correlación, los cuatro operadores,
-deduplicación persistente, eventos, redelivery/DLC y preservación de estados.
-El broker Docker sigue siendo Artemis 2.44.0 y no se necesita Docker para los tests.
+No hace falta borrar los volúmenes para ejecutar la aplicación o las pruebas.
 
-Referencias: [JMS Request-Reply de Camel](https://camel.apache.org/components/4.18.x/jms-component.html)
-y [Dead Letter Channel](https://camel.apache.org/components/4.18.x/eips/dead-letter-channel.html).
+## Operadores simulados
 
+WireMock representa a **Tigo, Personal, Claro y Vox**, tanto como donantes como
+receptores. Los [mappings](wiremock/mappings/) distinguen el rol con
+`X-Operador-Donante` o `X-Operador-Receptor`, establecidos por el Content-Based Router.
 
-### Verificación de una instalación limpia
+| Endpoint de WireMock | Request interno | Respuesta esperada |
+| --- | --- | --- |
+| `POST /operador/pin-notification` | `request_id`, `msisdn`, `documento_titular`, `pin` | Mismo `request_id`, `estado: PIN_ENVIADO` y mensaje; no devuelve el PIN |
+| `POST /operador/portability-approval` | `request_id`, `msisdn`, `documento_titular`, `operador_receptor` | Mismo `request_id`, `estado: APPROVED` o `REJECTED`, `motivo` |
+| `POST /receptor/portability-result` | `request_id`, `msisdn`, `estado`, operadores, `fecha_finalizacion`, `motivo` | Mismo `request_id`, `estado: RECIBIDO` |
 
-Compose monta `init.sql` como `01-init.sql` y `messaging.sql` como
-`02-messaging.sql` dentro de `/docker-entrypoint-initdb.d/`. En un volumen nuevo,
-PostgreSQL ejecuta ambos: crea automáticamente `portability_request`,
-`ported_number` y `processed_message`. La ejecución manual de `messaging.sql`
-solo corresponde a volúmenes antiguos que todavía no tienen esa tabla.
+Las respuestas normales son HTTP 200. Una aprobación tiene `motivo: null`;
+un rechazo requiere un motivo no vacío. El documento **`TEST-REJECTED`** activa
+únicamente un escenario controlado del mock para simular el rechazo del donante
+con `Datos del titular no coinciden`. La creación todavía devuelve PIN_GENERATED:
+el rechazo se obtiene después de confirmar correctamente el PIN y consultar al donante.
 
-`PostgresInitializationTest` comprueba los montajes y su orden, y ejecuta los
-scripts reales sin modificarlos sobre una base H2 vacía, con un alias de
-compatibilidad para TIMESTAMPTZ. Esta prueba no sustituye una ejecución del
-contenedor PostgreSQL, pero detecta scripts faltantes y tablas no inicializadas.
-La revisión no requiere ejecutar `docker compose down -v` ni borrar datos locales.
+Los mappings usan `response-template` para correlacionar el ID. Si se modifican
+con WireMock ya iniciado, se pueden recargar con `docker compose restart wiremock`.
+
+## Ejecución
+
+Requisitos: JDK 21, Docker y Docker Compose. Se usa Gradle Wrapper; no hace falta
+instalar Gradle global. Desde la raíz del repositorio:
+
+```sh
+docker compose up -d
+docker compose ps
+./gradlew bootRun
+```
+
+En otra terminal, ejecutar las pruebas:
+
+```sh
+./gradlew test
+```
+
+En Windows se puede usar `gradlew.bat`. Docker inicia la infraestructura;
+`bootRun` inicia la aplicación Spring Boot localmente.
+
+| Servicio | Dirección local |
+| --- | --- |
+| API EAPN | `http://localhost:8080` |
+| PostgreSQL | `localhost:5432`, base `eapn` |
+| Artemis JMS | `tcp://localhost:61616` |
+| Consola Artemis | `http://localhost:8161/console` |
+| WireMock | `http://localhost:8081` |
+
+Las credenciales **exclusivamente de desarrollo** configuradas para PostgreSQL y
+Artemis son `eapn` / `eapn_dev`. No se necesitan secretos reales para la demostración.
+
+Variables de entorno: `DB_URL`, `DB_USER`, `DB_PASSWORD`, `ARTEMIS_BROKER_URL`,
+`ARTEMIS_USER`, `ARTEMIS_PASSWORD`, `WIREMOCK_BASE_URL` y `APP_TIMEZONE`.
+Exportarlas para compartirlas entre Compose y `bootRun`; Spring Boot no carga
+`.env` automáticamente. Los timeouts configurables son
+`DONOR_APPROVAL_RESPONSE_TIMEOUT_MS` y `RECEIVER_NOTIFICATION_RESPONSE_TIMEOUT_MS`
+(5000 ms), y `MESSAGING_REQUEST_TIMEOUT_MS` (60000 ms). El timeout JMS debe superar
+los tres intentos HTTP y sus pausas si se cambian estos valores.
+
+### Alcance de recuperación
+
+No se implementan XA ni outbox. Un timeout puede ocurrir después de que el operador
+haya procesado una llamada. La recuperación tras una caída entre etapas requiere
+revisar la solicitud y el resultado externo; no se debe reproducir ciegamente el
+flujo completo. Un reenvío explícito debe respetar el PIN original y su vigencia.
+Los eventos son asíncronos y pueden llegar fuera de orden; el estado PostgreSQL
+es la referencia. Si Artemis está caído tampoco se puede garantizar escribir
+en su cola de errores. Estas limitaciones no convierten fallos técnicos en REJECTED.
+
+## Evidencias
+
+Capturas existentes de la demostración local, enlazadas con rutas relativas.
+Las capturas de requests y base de datos muestran PIN de prueba; las respuestas
+públicas no lo incluyen. La captura de consola conserva pestañas ajenas a la
+aplicación; la evidencia relevante es el panel de Artemis. No hay capturas de
+commits ni PRs en esta carpeta.
+
+### Infraestructura Docker
+
+![Servicios Docker levantados y healthy](evidencias/01-docker-compose-healthy.png)
+
+### Ejecución de pruebas Gradle
+
+![Ejecución previa de Gradle con BUILD SUCCESSFUL](evidencias/02-gradle-tests.png)
+
+### Creación de solicitud
+
+![POST portabilidad con HTTP 201 y PIN_GENERATED](evidencias/03-post-portabilidad.png)
+
+### Persistencia del PIN generado
+
+![Registro de prueba PIN_GENERATED y fechas en PostgreSQL](evidencias/04-pin-generated-db.png)
+
+### Confirmación y finalización
+
+![Confirmación del PIN con respuesta COMPLETED](evidencias/05-confirmacion-pin.png)
+
+### Consulta de solicitud completada
+
+![GET de solicitud COMPLETED con fechas del proceso](evidencias/06-get-completed.png)
+
+### Número portado
+
+![Registro del número portado con operadores anterior y actual](evidencias/07-ported-number.png)
+
+### Canales Artemis
+
+![Consola Artemis con las tres colas de operaciones EAPN](evidencias/08-artemis-messaging.png)
+
+### Creación del escenario de rechazo
+
+![Solicitud creada con documento TEST-REJECTED](evidencias/09-post-rejected-flow.png)
+
+### Rechazo real del donante y consulta
+
+![Confirmación con decisión REJECTED y GET con motivo de rechazo](evidencias/11-get-rejected.png)
+
+## Pruebas
+
+```sh
+./gradlew test --rerun-tasks
+docker compose config --quiet
+git diff --check
+```
+
+La suite cubre validaciones y PIN, repositories, transacciones de finalización,
+los tres endpoints, estados de negocio y protección del DTO público. Las pruebas
+de mensajería usan Artemis Jakarta 2.40.0 embebido, H2 con JDBC real y WireMock
+local: verifican correlación, cuatro operadores, duplicados, redelivery, DLC,
+eventos y conservación de estados ante fallos. No dependen de servicios Docker.
+Los tests HTTP aislados usan `app.messaging.enabled=false`; la ejecución normal
+usa `true`, sin fallback silencioso cuando falla Artemis.
+
+`PostgresInitializationTest` verifica los montajes de Compose y ejecuta los
+scripts reales sobre H2 vacío, con un alias para TIMESTAMPTZ. Esta prueba valida
+la creación de las tres tablas sin reemplazar una prueba del contenedor PostgreSQL.
+
+Verificación final ejecutada el **18 de septiembre de 2026** con
+`./gradlew test --rerun-tasks`: **273 tests, 0 fallos, 0 errores y 0 omitidos**.
+Resultado: **BUILD SUCCESSFUL**. El conteo proviene de los reportes XML de esta
+ejecución, no de la captura histórica de Gradle. El informe HTML se genera en
+`build/reports/tests/test/index.html` y no se versiona.
