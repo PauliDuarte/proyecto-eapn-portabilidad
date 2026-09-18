@@ -15,7 +15,9 @@ import javax.sql.DataSource;
 import jakarta.jms.ConnectionFactory;
 
 import com.fasterxml.jackson.databind.ObjectMapper;
+import com.github.tomakehurst.wiremock.WireMockServer;
 import org.apache.camel.test.spring.junit5.CamelSpringBootTest;
+import org.junit.jupiter.api.AfterAll;
 import org.junit.jupiter.api.AfterEach;
 import org.junit.jupiter.api.BeforeEach;
 import org.junit.jupiter.api.Test;
@@ -27,21 +29,48 @@ import org.springframework.boot.test.context.SpringBootTest;
 import org.springframework.boot.test.web.server.LocalServerPort;
 import org.springframework.dao.DataAccessResourceFailureException;
 import org.springframework.test.context.bean.override.mockito.MockitoBean;
+import org.springframework.test.context.DynamicPropertyRegistry;
+import org.springframework.test.context.DynamicPropertySource;
+import org.springframework.test.annotation.DirtiesContext;
 
 import py.edu.ucom.is2.eapn.model.PortabilityRequest;
 import py.edu.ucom.is2.eapn.model.PortabilityStatus;
 import py.edu.ucom.is2.eapn.repository.PortabilityRequestRepository;
+import py.edu.ucom.is2.eapn.repository.PortedNumberRepository;
 
 import static org.assertj.core.api.Assertions.assertThat;
 import static org.mockito.Mockito.verify;
 import static org.mockito.Mockito.verifyNoInteractions;
 import static org.mockito.Mockito.verifyNoMoreInteractions;
 import static org.mockito.Mockito.when;
+import static org.mockito.Mockito.inOrder;
+import static com.github.tomakehurst.wiremock.core.WireMockConfiguration.wireMockConfig;
+import static com.github.tomakehurst.wiremock.client.WireMock.*;
 
 @CamelSpringBootTest
 @SpringBootTest(webEnvironment = SpringBootTest.WebEnvironment.RANDOM_PORT,
-        properties = "camel.springboot.main-run-controller=false")
+        properties = {"camel.springboot.main-run-controller=false", "app.donor-approval.response-timeout-ms=1000"})
+@DirtiesContext(classMode = DirtiesContext.ClassMode.AFTER_CLASS)
 class PinConfirmationRouteTest {
+
+    private static final String APPROVAL_PATH = "/operador/portability-approval";
+    private static final WireMockServer DONOR = startDonor();
+
+    private static WireMockServer startDonor() {
+        var server = new WireMockServer(wireMockConfig().dynamicPort().usingFilesUnderDirectory("wiremock"));
+        server.start();
+        return server;
+    }
+
+    @DynamicPropertySource
+    static void donorProperties(DynamicPropertyRegistry registry) {
+        registry.add("app.wiremock.base-url", DONOR::baseUrl);
+    }
+
+    @AfterAll
+    static void stopDonor() {
+        DONOR.stop();
+    }
 
     private static final String ID = "REQ-confirm-test";
     private static final Clock FIXED_CLOCK = Clock.fixed(Instant.parse("2026-09-18T01:30:00Z"),
@@ -55,6 +84,8 @@ class PinConfirmationRouteTest {
     @MockitoBean
     private PortabilityRequestRepository repository;
     @MockitoBean
+    private PortedNumberRepository portedNumbers;
+    @MockitoBean
     private Clock clock;
     @MockitoBean
     private DataSource dataSource;
@@ -63,19 +94,23 @@ class PinConfirmationRouteTest {
 
     @BeforeEach
     void setClock() {
+        DONOR.resetToDefaultMappings();
         when(clock.instant()).thenReturn(FIXED_CLOCK.instant());
         when(clock.getZone()).thenReturn(FIXED_CLOCK.getZone());
     }
 
     @AfterEach
     void noExternalInfrastructure() {
-        verifyNoInteractions(dataSource, connectionFactory);
+        verifyNoInteractions(dataSource, connectionFactory, portedNumbers);
     }
 
-    @Test
-    void returns200WithConfirmationJsonAndPersistsTimestamp() throws Exception {
-        givenRequest(PortabilityStatus.PIN_GENERATED, NOW.plusMinutes(1));
+    @ParameterizedTest
+    @ValueSource(strings = {"Tigo", "Personal", "Claro", "Vox"})
+    void confirmsThenRequestsApprovalForEachDonor(String donor) throws Exception {
+        givenRequest(PortabilityStatus.PIN_GENERATED, NOW.plusMinutes(1), donor, "12345");
         when(repository.confirmPin(ID, NOW)).thenReturn(1);
+        when(repository.markPendingDonor(ID)).thenReturn(1);
+        when(repository.approveByDonor(ID)).thenReturn(1);
 
         var response = post("{\"pin\":\"000042\"}");
         assertThat(response.statusCode()).isEqualTo(200);
@@ -83,12 +118,24 @@ class PinConfirmationRouteTest {
         var body = mapper.readTree(response.body());
         assertThat(body.size()).isEqualTo(3);
         assertThat(body.path("id").asText()).isEqualTo(ID);
-        assertThat(body.path("estado").asText()).isEqualTo("CONFIRMED");
-        assertThat(body.path("mensaje").asText()).isEqualTo("PIN confirmado correctamente");
+        assertThat(body.path("estado").asText()).isEqualTo("APPROVED");
+        assertThat(body.path("mensaje").asText()).isEqualTo("Solicitud aprobada por el operador donante");
         assertThat(body.has("pin")).isFalse();
-        verify(repository).findById(ID);
-        verify(repository).confirmPin(ID, NOW);
-        verifyNoMoreInteractions(repository);
+        var order = inOrder(repository);
+        order.verify(repository).findById(ID);
+        order.verify(repository).confirmPin(ID, NOW);
+        order.verify(repository).markPendingDonor(ID);
+        order.verify(repository).approveByDonor(ID);
+        order.verifyNoMoreInteractions();
+        DONOR.verify(1, postRequestedFor(urlEqualTo(APPROVAL_PATH))
+                .withHeader("X-Operador-Donante", equalTo(donor))
+                .withRequestBody(matchingJsonPath("$.request_id", equalTo(ID)))
+                .withRequestBody(matchingJsonPath("$.msisdn", equalTo("+595971234567")))
+                .withRequestBody(matchingJsonPath("$.documento_titular", equalTo("12345")))
+                .withRequestBody(matchingJsonPath("$.operador_receptor", equalTo(donor.equals("Personal") ? "Tigo" : "Personal"))));
+        var sent = mapper.readTree(DONOR.getAllServeEvents().getFirst().getRequest().getBodyAsString());
+        assertThat(sent.size()).isEqualTo(4);
+        assertThat(sent.has("pin")).isFalse();
     }
 
     @Test
@@ -187,14 +234,127 @@ class PinConfirmationRouteTest {
     }
 
     private void givenRequest(PortabilityStatus status, OffsetDateTime expiration) {
+        givenRequest(status, expiration, "Tigo", "12345");
+    }
+
+    private void givenRequest(PortabilityStatus status, OffsetDateTime expiration, String donor, String document) {
         when(repository.findById(ID)).thenReturn(Optional.of(new PortabilityRequest(ID, "+595971234567",
-                "12345", "Tigo", "Personal", status, "000042", expiration, 2,
+                document, donor, donor.equals("Personal") ? "Tigo" : "Personal", status, "000042", expiration, 2,
                 NOW.minusMinutes(20), NOW.minusMinutes(14), null, null, null)));
     }
 
     private void verifyReadOnly() {
         verify(repository).findById(ID);
         verifyNoMoreInteractions(repository);
+        assertThat(DONOR.getAllServeEvents()).isEmpty();
+    }
+
+    @ParameterizedTest
+    @ValueSource(strings = {"Tigo", "Personal", "Claro", "Vox"})
+    void controlledRejectionPersistsDonorReason(String donor) throws Exception {
+        givenRequest(PortabilityStatus.PIN_GENERATED, NOW.plusMinutes(1), donor, "TEST-REJECTED");
+        when(repository.confirmPin(ID, NOW)).thenReturn(1);
+        when(repository.markPendingDonor(ID)).thenReturn(1);
+        when(repository.rejectByDonor(ID, "Datos del titular no coinciden")).thenReturn(1);
+
+        var response = post("{\"pin\":\"000042\"}");
+        assertThat(response.statusCode()).isEqualTo(200);
+        var body = mapper.readTree(response.body());
+        assertThat(body.path("id").asText()).isEqualTo(ID);
+        assertThat(body.path("estado").asText()).isEqualTo("REJECTED");
+        assertThat(body.path("mensaje").asText()).isEqualTo("Datos del titular no coinciden");
+        var order = inOrder(repository);
+        order.verify(repository).findById(ID);
+        order.verify(repository).confirmPin(ID, NOW);
+        order.verify(repository).markPendingDonor(ID);
+        order.verify(repository).rejectByDonor(ID, "Datos del titular no coinciden");
+        order.verifyNoMoreInteractions();
+        DONOR.verify(1, postRequestedFor(urlEqualTo(APPROVAL_PATH)).withHeader("X-Operador-Donante", equalTo(donor)));
+    }
+
+    @ParameterizedTest
+    @ValueSource(ints = {400, 500, 503})
+    void httpFailureLeavesPendingDonor(int code) throws Exception {
+        allowPendingDonor();
+        DONOR.stubFor(com.github.tomakehurst.wiremock.client.WireMock.post(urlEqualTo(APPROVAL_PATH))
+                .atPriority(0).willReturn(aResponse().withStatus(code).withBody("private-donor-details")));
+        assertTechnicalFailure();
+    }
+
+    @ParameterizedTest
+    @ValueSource(strings = {"{", "null", "{}", "[]",
+            "{\"request_id\":\"wrong-id\",\"estado\":\"APPROVED\"}",
+            "{\"request_id\":\"REQ-confirm-test\",\"estado\":\"COMPLETED\"}",
+            "{\"request_id\":\"REQ-confirm-test\",\"estado\":null}",
+            "{\"request_id\":\"REQ-confirm-test\",\"estado\":\"REJECTED\",\"motivo\":null}",
+            "{\"request_id\":\"REQ-confirm-test\",\"estado\":\"REJECTED\",\"motivo\":\"  \"}",
+            "{\"request_id\":\"REQ-confirm-test\",\"estado\":\"REJECTED\",\"motivo\":123}",
+            "{\"request_id\":\"REQ-confirm-test\",\"estado\":\"APPROVED\"} {}"})
+    void invalidResponseLeavesPendingDonor(String json) throws Exception {
+        allowPendingDonor();
+        DONOR.stubFor(com.github.tomakehurst.wiremock.client.WireMock.post(urlEqualTo(APPROVAL_PATH))
+                .atPriority(0).willReturn(aResponse().withStatus(200).withHeader("Content-Type", "application/json")
+                        .withBody(json)));
+        assertTechnicalFailure();
+    }
+
+    @Test
+    void noResponseLeavesPendingDonorWithoutResending() throws Exception {
+        allowPendingDonor();
+        DONOR.stubFor(com.github.tomakehurst.wiremock.client.WireMock.post(urlEqualTo(APPROVAL_PATH))
+                .atPriority(0).willReturn(aResponse().withFault(com.github.tomakehurst.wiremock.http.Fault.EMPTY_RESPONSE)));
+        assertTechnicalFailure();
+    }
+
+    @Test
+    void timeoutLeavesPendingDonorWithoutResending() throws Exception {
+        allowPendingDonor();
+        DONOR.stubFor(com.github.tomakehurst.wiremock.client.WireMock.post(urlEqualTo(APPROVAL_PATH))
+                .atPriority(0).willReturn(aResponse().withStatus(200).withFixedDelay(2000)));
+        assertTechnicalFailure();
+    }
+
+    @Test
+    void failedPendingTransitionDoesNotCallDonor() throws Exception {
+        givenRequest(PortabilityStatus.PIN_GENERATED, NOW.plusMinutes(1));
+        when(repository.confirmPin(ID, NOW)).thenReturn(1);
+        when(repository.markPendingDonor(ID)).thenReturn(0);
+        assertThat(post("{\"pin\":\"000042\"}").statusCode()).isEqualTo(500);
+        assertThat(DONOR.getAllServeEvents()).isEmpty();
+    }
+
+    @Test
+    void failedDecisionPersistenceDoesNotReportApproval() throws Exception {
+        allowPendingDonor();
+        when(repository.approveByDonor(ID)).thenReturn(0);
+        assertThat(post("{\"pin\":\"000042\"}").statusCode()).isEqualTo(500);
+        verify(repository).findById(ID);
+        verify(repository).confirmPin(ID, NOW);
+        verify(repository).markPendingDonor(ID);
+        verify(repository).approveByDonor(ID);
+        verifyNoMoreInteractions(repository);
+    }
+
+    private void allowPendingDonor() {
+        givenRequest(PortabilityStatus.PIN_GENERATED, NOW.plusMinutes(1));
+        when(repository.confirmPin(ID, NOW)).thenReturn(1);
+        when(repository.markPendingDonor(ID)).thenReturn(1);
+    }
+
+    private void assertTechnicalFailure() throws Exception {
+        var response = post("{\"pin\":\"000042\"}");
+        assertThat(response.statusCode()).isEqualTo(502);
+        assertJson(response);
+        var body = mapper.readTree(response.body());
+        assertThat(body.path("estado").asText()).isEqualTo("ERROR");
+        assertThat(body.path("mensaje").asText()).contains("Solicitud pendiente: " + ID);
+        assertThat(response.body()).doesNotContain("private-donor-details", "000042");
+        var order = inOrder(repository);
+        order.verify(repository).findById(ID);
+        order.verify(repository).confirmPin(ID, NOW);
+        order.verify(repository).markPendingDonor(ID);
+        order.verifyNoMoreInteractions();
+        DONOR.verify(1, postRequestedFor(urlEqualTo(APPROVAL_PATH)));
     }
 
     private HttpResponse<String> post(String body) throws Exception {

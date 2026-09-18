@@ -1,0 +1,47 @@
+{
+  "name": "Rechazo controlado de portabilidad",
+  "priority": 1,
+  "request": {
+    "method": "POST",
+    "urlPath": "/operador/portability-approval",
+    "headers": {
+      "X-Operador-Donante": {
+        "matches": "Tigo|Personal|Claro|Vox"
+      },
+      "Content-Type": {
+        "contains": "application/json"
+      }
+    },
+    "bodyPatterns": [
+      {
+        "matchesJsonPath": "$.request_id"
+      },
+      {
+        "matchesJsonPath": "$.msisdn"
+      },
+      {
+        "matchesJsonPath": "$.operador_receptor"
+      },
+      {
+        "matchesJsonPath": {
+          "expression": "$.documento_titular",
+          "equalTo": "TEST-REJECTED"
+        }
+      }
+    ]
+  },
+  "response": {
+    "status": 200,
+    "headers": {
+      "Content-Type": "application/json"
+    },
+    "jsonBody": {
+      "request_id": "{{jsonPath request.body '$.request_id'}}",
+      "estado": "REJECTED",
+      "motivo": "Datos del titular no coinciden"
+    },
+    "transformers": [
+      "response-template"
+    ]
+  }
+}

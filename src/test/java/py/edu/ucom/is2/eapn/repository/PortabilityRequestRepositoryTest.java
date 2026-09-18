@@ -325,4 +325,46 @@ class PortabilityRequestRepositoryTest {
                 PortabilityStatus.REJECTED, "001234", EXPIRES, 2, CREATED, GENERATED, CONFIRMED,
                 COMPLETED, "Motivo de prueba");
     }
+
+    @Test
+    void pendingDonorOnlyTransitionsFromConfirmed() {
+        when(jdbc.update(anyString(), any(MapSqlParameterSource.class))).thenReturn(1);
+        assertThat(repository.markPendingDonor("req-1")).isEqualTo(1);
+        var params = captureUpdate("""
+                UPDATE portability_request SET estado = 'PENDING_DONOR'
+                WHERE id = :id AND estado = 'CONFIRMED'
+                """);
+        assertThat(params.getValues()).containsOnlyKeys("id");
+    }
+
+    @Test
+    void donorApprovalOnlyTransitionsFromPendingWithoutCompleting() {
+        when(jdbc.update(anyString(), any(MapSqlParameterSource.class))).thenReturn(1);
+        assertThat(repository.approveByDonor("req-1")).isEqualTo(1);
+        var params = captureUpdate("""
+                UPDATE portability_request SET estado = 'APPROVED', motivo_rechazo = NULL
+                WHERE id = :id AND estado = 'PENDING_DONOR'
+                """);
+        assertThat(params.getValues()).containsOnlyKeys("id");
+    }
+
+    @Test
+    void donorRejectionStoresReasonOnlyFromPendingWithoutCompleting() {
+        when(jdbc.update(anyString(), any(MapSqlParameterSource.class))).thenReturn(1);
+        assertThat(repository.rejectByDonor("req-1", "Datos del titular no coinciden")).isEqualTo(1);
+        var params = captureUpdate("""
+                UPDATE portability_request SET estado = 'REJECTED', motivo_rechazo = :motivo
+                WHERE id = :id AND estado = 'PENDING_DONOR'
+                """);
+        assertThat(params.getValues()).hasSize(2).containsEntry("motivo", "Datos del titular no coinciden");
+        assertThat(params.getSqlType("motivo")).isEqualTo(Types.VARCHAR);
+    }
+
+    @Test
+    void donorTransitionsExposeNoMatchingRow() {
+        when(jdbc.update(anyString(), any(MapSqlParameterSource.class))).thenReturn(0);
+        assertThat(repository.markPendingDonor("req-1")).isZero();
+        assertThat(repository.approveByDonor("req-1")).isZero();
+        assertThat(repository.rejectByDonor("req-1", "Motivo")).isZero();
+    }
 }

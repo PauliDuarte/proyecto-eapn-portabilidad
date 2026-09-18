@@ -11,21 +11,30 @@ import org.apache.camel.Exchange;
 import org.apache.camel.builder.RouteBuilder;
 import org.apache.camel.component.jackson.JacksonDataFormat;
 import org.springframework.stereotype.Component;
+import org.slf4j.Logger;
+import org.slf4j.LoggerFactory;
 
+import py.edu.ucom.is2.eapn.model.PortabilityRequest;
+import py.edu.ucom.is2.eapn.model.dto.DonorApprovalResponse;
 import py.edu.ucom.is2.eapn.model.dto.ConfirmPinRequest;
 import py.edu.ucom.is2.eapn.model.dto.ConfirmPinResponse;
 import py.edu.ucom.is2.eapn.model.dto.PortabilityErrorResponse;
 import py.edu.ucom.is2.eapn.service.PinConfirmationException;
 import py.edu.ucom.is2.eapn.service.PinConfirmationService;
+import py.edu.ucom.is2.eapn.service.DonorApprovalException;
+import py.edu.ucom.is2.eapn.service.DonorApprovalService;
 
 @Component
 public class PinConfirmationRoute extends RouteBuilder {
 
+    private static final Logger LOG = LoggerFactory.getLogger(PinConfirmationRoute.class);
     private final PinConfirmationService service;
+    private final DonorApprovalService approvalService;
     private final ObjectMapper mapper;
 
-    public PinConfirmationRoute(PinConfirmationService service, ObjectMapper mapper) {
+    public PinConfirmationRoute(PinConfirmationService service, DonorApprovalService approvalService, ObjectMapper mapper) {
         this.service = service;
+        this.approvalService = approvalService;
         this.mapper = mapper;
     }
 
@@ -36,6 +45,20 @@ public class PinConfirmationRoute extends RouteBuilder {
                 .setCoercion(CoercionInputShape.Integer, CoercionAction.Fail)
                 .setCoercion(CoercionInputShape.Float, CoercionAction.Fail)
                 .setCoercion(CoercionInputShape.Boolean, CoercionAction.Fail);
+
+        onException(DonorApprovalException.class)
+                .maximumRedeliveries(0).handled(true)
+                .process(exchange -> {
+                    var request = exchange.getProperty(DonorApprovalRoute.REQUEST_PROPERTY, PortabilityRequest.class);
+                    var failure = exchange.getProperty(Exchange.EXCEPTION_CAUGHT, DonorApprovalException.class);
+                    LOG.warn("Consulta al donante fallida: request_id={}, donante={}, motivo={}",
+                            request.id(), request.operadorDonante(), failure.getMessage());
+                    exchange.getMessage().setBody(new PortabilityErrorResponse("ERROR",
+                            "No se pudo obtener la decisión del donante. Solicitud pendiente: " + request.id()));
+                })
+                .removeHeaders("*")
+                .setHeader(Exchange.HTTP_RESPONSE_CODE, constant(502))
+                .marshal(new JacksonDataFormat(mapper, PortabilityErrorResponse.class));
 
         onException(PinConfirmationException.class)
                 .maximumRedeliveries(0).handled(true)
@@ -81,6 +104,11 @@ public class PinConfirmationRoute extends RouteBuilder {
                     var input = exchange.getMessage().getBody(ConfirmPinRequest.class);
                     exchange.getMessage().setBody(service.confirm(id, input));
                 })
+                .process(exchange -> exchange.getMessage().setBody(
+                        approvalService.begin(exchange.getMessage().getBody(PortabilityRequest.class))))
+                .to("direct:solicitar-aprobacion-donante")
+                .process(exchange -> exchange.getMessage().setBody(
+                        approvalService.applyDecision(exchange.getMessage().getBody(DonorApprovalResponse.class))))
                 .setHeader(Exchange.HTTP_RESPONSE_CODE, constant(200))
                 .marshal(new JacksonDataFormat(mapper, ConfirmPinResponse.class));
     }

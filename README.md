@@ -3,7 +3,7 @@
 Proyecto universitario: base técnica del Desafío 1, integrador de una EAPN de
 Portabilidad Numérica en Paraguay. Incluye la recepción REST, validación inicial
 y persistencia PostgreSQL, generación de PIN, notificación al operador donante
-y confirmación del PIN por el titular.
+y confirmación del PIN por el titular, seguida de la decisión del operador donante.
 
 **Stack:** Java 21, Gradle Wrapper 9.6.0, Spring Boot 3.5.16, Apache Camel 4.18.3
 (Java DSL), JMS con Apache ActiveMQ Artemis 2.44.0, PostgreSQL 17.6,
@@ -20,7 +20,7 @@ docker compose up -d
 Desarrollo local: PostgreSQL en `localhost:5432`, base `eapn`; Artemis JMS en
 `localhost:61616` y consola en `http://localhost:8161`. Ambos usan usuario `eapn`
 y contraseña `eapn_dev` (solo desarrollo). WireMock: `http://localhost:8081`;
-los mappings de notificación están en `wiremock/mappings/`.
+los mappings de notificación y aprobación están en `wiremock/mappings/`.
 
 Configuración por entorno: `DB_URL`, `DB_USER`, `DB_PASSWORD`,
 `ARTEMIS_BROKER_URL`, `ARTEMIS_USER`, `ARTEMIS_PASSWORD`, `WIREMOCK_BASE_URL`
@@ -99,7 +99,7 @@ No hay reintentos automáticos ni DLC en esta etapa; la excepción de integraci�
 queda separada para incorporar esa política posteriormente.
 
 Los tests HTTP arrancan WireMock en la JVM con puerto aleatorio y cargan los
-cuatro mappings del repositorio. No necesitan Docker, PostgreSQL ni Artemis.
+mappings del repositorio. No necesitan Docker, PostgreSQL ni Artemis.
 
 ## Confirmación del PIN
 
@@ -114,10 +114,11 @@ La comparación temporal usa el `Clock` configurado y `OffsetDateTime`:
 Si además es incorrecto, prevalece el motivo de expiración.
 
 Un PIN correcto y vigente guarda `CONFIRMED` y `fecha_pin_confirmado = now`,
-limpia cualquier motivo técnico anterior y devuelve HTTP 200:
+limpia cualquier motivo técnico anterior y continúa inmediatamente con la consulta
+al donante. La respuesta HTTP 200 refleja su decisión, por ejemplo:
 
 ```json
-{"id":"REQ-...","estado":"CONFIRMED","mensaje":"PIN confirmado correctamente"}
+{"id":"REQ-...","estado":"APPROVED","mensaje":"Solicitud aprobada por el operador donante"}
 ```
 
 Un PIN incorrecto o expirado guarda `REJECTED` y su motivo específico, sin marcar
@@ -131,14 +132,61 @@ devuelve conflicto; no se implementa idempotencia ni un límite de reintentos.
 
 | HTTP | Resultado |
 | --- | --- |
-| 200 | PIN confirmado |
+| 200 | PIN confirmado y decisión de negocio del donante: APPROVED o REJECTED |
 | 400 | JSON/PIN malformado, PIN incorrecto o expirado |
 | 404 | Solicitud inexistente |
 | 409 | Estado incompatible, PIN generado incompleto o cambio concurrente de estado |
 | 500 | Error de persistencia o procesamiento |
+| 502 | Error técnico al consultar al donante; la solicitud conserva PENDING_DONOR |
 
 Los errores 400/404/409 conservan el formato
 `{"estado":"RECHAZADA","mensaje":"..."}`. Ese estado describe la respuesta;
-solo un PIN incorrecto o expirado cambia la solicitud a `REJECTED`.
-Los errores 500 usan `estado: ERROR`. Ninguna respuesta incluye el PIN.
-Los tests de confirmación usan reloj fijo y repository simulado, sin servicios externos.
+en la validación del PIN, solo uno incorrecto o expirado cambia la solicitud a `REJECTED`.
+Los errores 500/502 usan `estado: ERROR`. Ninguna respuesta incluye el PIN.
+Los tests de confirmación usan reloj fijo, repository simulado y WireMock embebido.
+
+## Decisión del operador donante
+
+Flujo después del PIN correcto:
+
+```text
+CONFIRMED → PENDING_DONOR → APPROVED
+                         → REJECTED (con motivo)
+```
+
+`DonorApprovalService` persiste `PENDING_DONOR` antes de hacer la consulta.
+Camel utiliza `direct:solicitar-aprobacion-donante` para enviar
+`POST ${WIREMOCK_BASE_URL}/operador/portability-approval` con
+`X-Operador-Donante: Tigo|Personal|Claro|Vox` y estos campos:
+
+```json
+{
+  "request_id": "REQ-...",
+  "msisdn": "+595971234567",
+  "documento_titular": "12345",
+  "operador_receptor": "Personal"
+}
+```
+
+La respuesta debe ser HTTP 200, JSON válido y contener el mismo `request_id`,
+`estado` exactamente `APPROVED` o `REJECTED`, y un `motivo` no vacío si rechaza.
+Una decisión válida se persiste mediante un UPDATE condicionado a `PENDING_DONOR`.
+El rechazo de negocio devuelve HTTP 200 con `estado: REJECTED` y su motivo en
+`mensaje`, y guarda ese motivo en `motivo_rechazo`.
+
+Los cuatro mappings normales responden `APPROVED` con `motivo: null`.
+Para simular un rechazo con cualquier donante, crear la solicitud usando
+`documento_titular: TEST-REJECTED`: el mapping de mayor prioridad responde
+`REJECTED` con `Datos del titular no coinciden`. Es una regla exclusiva del mock;
+no hay un caso especial para ese documento en el código de negocio.
+
+Errores HTTP, falta de respuesta, timeout, JSON inválido, correlación incorrecta,
+estado desconocido o rechazo sin motivo devuelven HTTP 502. La solicitud queda
+en `PENDING_DONOR`, sin guardar una decisión de negocio ni un motivo de rechazo.
+El motivo técnico se registra en logs junto con ID/donante, sin cuerpos HTTP.
+El timeout de respuesta se configura con `DONOR_APPROVAL_RESPONSE_TIMEOUT_MS`
+(por defecto 5000 ms). No hay reintentos automáticos ni DLC; la excepción técnica
+se mantiene separada para incorporar esa recuperación en otra etapa.
+
+Esta etapa no escribe en `ported_number`, no usa `COMPLETED` ni completa
+`fecha_completada`, y no notifica al receptor.

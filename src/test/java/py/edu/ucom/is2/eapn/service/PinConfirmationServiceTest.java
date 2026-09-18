@@ -57,7 +57,8 @@ class PinConfirmationServiceTest {
 
         assertThat(result.id()).isEqualTo(ID);
         assertThat(result.estado()).isEqualTo(PortabilityStatus.CONFIRMED);
-        assertThat(result.mensaje()).isEqualTo("PIN confirmado correctamente");
+        assertThat(result.fechaPinConfirmado()).isEqualTo(NOW);
+        assertThat(result.intentosConfirmacion()).isEqualTo(3);
         var order = inOrder(repository);
         order.verify(repository).findById(ID);
         order.verify(repository).confirmPin(ID, NOW);

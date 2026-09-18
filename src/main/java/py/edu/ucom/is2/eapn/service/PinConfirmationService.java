@@ -7,8 +7,8 @@ import java.util.regex.Pattern;
 import org.springframework.stereotype.Service;
 
 import py.edu.ucom.is2.eapn.model.PortabilityStatus;
+import py.edu.ucom.is2.eapn.model.PortabilityRequest;
 import py.edu.ucom.is2.eapn.model.dto.ConfirmPinRequest;
-import py.edu.ucom.is2.eapn.model.dto.ConfirmPinResponse;
 import py.edu.ucom.is2.eapn.repository.PortabilityRequestRepository;
 
 import static py.edu.ucom.is2.eapn.service.PinConfirmationException.Reason.*;
@@ -25,7 +25,7 @@ public class PinConfirmationService {
         this.clock = clock;
     }
 
-    public ConfirmPinResponse confirm(String id, ConfirmPinRequest input) {
+    public PortabilityRequest confirm(String id, ConfirmPinRequest input) {
         var request = repository.findById(id).orElseThrow(() -> new PinConfirmationException(
                 NOT_FOUND, "La solicitud de portabilidad no existe."));
         if (request.estado() != PortabilityStatus.PIN_GENERATED) {
@@ -51,7 +51,10 @@ public class PinConfirmationService {
         }
 
         requireUpdated(repository.confirmPin(id, now));
-        return new ConfirmPinResponse(id, PortabilityStatus.CONFIRMED, "PIN confirmado correctamente");
+        return new PortabilityRequest(request.id(), request.msisdn(), request.documentoTitular(),
+                request.operadorDonante(), request.operadorReceptor(), PortabilityStatus.CONFIRMED,
+                request.pin(), request.pinExpiracion(), request.intentosConfirmacion() + 1,
+                request.fechaCreacion(), request.fechaPinGenerado(), now, request.fechaCompletada(), null);
     }
 
     private void reject(String id, PinConfirmationException.Reason reason, String message) {

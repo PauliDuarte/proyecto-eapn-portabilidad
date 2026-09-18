@@ -138,6 +138,27 @@ public class PortabilityRequestRepository {
                 .addValue("motivo", motivo, Types.VARCHAR));
     }
 
+    public int markPendingDonor(String id) {
+        return jdbc.update("""
+                UPDATE portability_request SET estado = 'PENDING_DONOR'
+                WHERE id = :id AND estado = 'CONFIRMED'
+                """, new MapSqlParameterSource("id", id));
+    }
+
+    public int approveByDonor(String id) {
+        return jdbc.update("""
+                UPDATE portability_request SET estado = 'APPROVED', motivo_rechazo = NULL
+                WHERE id = :id AND estado = 'PENDING_DONOR'
+                """, new MapSqlParameterSource("id", id));
+    }
+
+    public int rejectByDonor(String id, String motivo) {
+        return jdbc.update("""
+                UPDATE portability_request SET estado = 'REJECTED', motivo_rechazo = :motivo
+                WHERE id = :id AND estado = 'PENDING_DONOR'
+                """, new MapSqlParameterSource("id", id).addValue("motivo", motivo, Types.VARCHAR));
+    }
+
     /** Permite una fecha nula si se registra un rechazo sin portación completada. */
     public int updateCompletion(String id, OffsetDateTime completada, String motivoRechazo) {
         return jdbc.update("""
