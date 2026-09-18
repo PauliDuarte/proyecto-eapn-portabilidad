@@ -1,0 +1,54 @@
+{
+  "name": "Resultado de portabilidad - receptor Vox",
+  "request": {
+    "method": "POST",
+    "urlPath": "/receptor/portability-result",
+    "headers": {
+      "X-Operador-Receptor": {
+        "equalTo": "Vox"
+      },
+      "Content-Type": {
+        "contains": "application/json"
+      }
+    },
+    "bodyPatterns": [
+      {
+        "matchesJsonPath": "$.request_id"
+      },
+      {
+        "matchesJsonPath": "$.msisdn"
+      },
+      {
+        "matchesJsonPath": "$.operador_donante"
+      },
+      {
+        "matchesJsonPath": {
+          "expression": "$.operador_receptor",
+          "equalTo": "Vox"
+        }
+      },
+      {
+        "matchesJsonPath": "$.fecha_finalizacion"
+      },
+      {
+        "matchesJsonPath": {
+          "expression": "$.estado",
+          "matches": "COMPLETED|REJECTED"
+        }
+      }
+    ]
+  },
+  "response": {
+    "status": 200,
+    "headers": {
+      "Content-Type": "application/json"
+    },
+    "jsonBody": {
+      "request_id": "{{jsonPath request.body '$.request_id'}}",
+      "estado": "RECIBIDO"
+    },
+    "transformers": [
+      "response-template"
+    ]
+  }
+}

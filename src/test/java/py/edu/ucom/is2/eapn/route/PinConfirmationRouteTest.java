@@ -10,6 +10,7 @@ import java.time.Instant;
 import java.time.OffsetDateTime;
 import java.time.ZoneId;
 import java.util.Optional;
+import java.util.concurrent.atomic.AtomicBoolean;
 
 import javax.sql.DataSource;
 import jakarta.jms.ConnectionFactory;
@@ -23,6 +24,7 @@ import org.junit.jupiter.api.BeforeEach;
 import org.junit.jupiter.api.Test;
 import org.junit.jupiter.params.ParameterizedTest;
 import org.junit.jupiter.params.provider.EnumSource;
+import org.junit.jupiter.params.provider.CsvSource;
 import org.junit.jupiter.params.provider.ValueSource;
 import org.springframework.beans.factory.annotation.Autowired;
 import org.springframework.boot.test.context.SpringBootTest;
@@ -32,9 +34,12 @@ import org.springframework.test.context.bean.override.mockito.MockitoBean;
 import org.springframework.test.context.DynamicPropertyRegistry;
 import org.springframework.test.context.DynamicPropertySource;
 import org.springframework.test.annotation.DirtiesContext;
+import org.springframework.transaction.PlatformTransactionManager;
+import org.springframework.transaction.support.SimpleTransactionStatus;
 
 import py.edu.ucom.is2.eapn.model.PortabilityRequest;
 import py.edu.ucom.is2.eapn.model.PortabilityStatus;
+import py.edu.ucom.is2.eapn.model.PortedNumber;
 import py.edu.ucom.is2.eapn.repository.PortabilityRequestRepository;
 import py.edu.ucom.is2.eapn.repository.PortedNumberRepository;
 
@@ -44,20 +49,32 @@ import static org.mockito.Mockito.verifyNoInteractions;
 import static org.mockito.Mockito.verifyNoMoreInteractions;
 import static org.mockito.Mockito.when;
 import static org.mockito.Mockito.inOrder;
+import static org.mockito.Mockito.doAnswer;
+import static org.mockito.Mockito.never;
+import static org.mockito.ArgumentMatchers.any;
 import static com.github.tomakehurst.wiremock.core.WireMockConfiguration.wireMockConfig;
 import static com.github.tomakehurst.wiremock.client.WireMock.*;
 
 @CamelSpringBootTest
 @SpringBootTest(webEnvironment = SpringBootTest.WebEnvironment.RANDOM_PORT,
-        properties = {"camel.springboot.main-run-controller=false", "app.donor-approval.response-timeout-ms=1000"})
+        properties = {"camel.springboot.main-run-controller=false", "app.donor-approval.response-timeout-ms=1000",
+                "app.receiver-notification.response-timeout-ms=1000"})
 @DirtiesContext(classMode = DirtiesContext.ClassMode.AFTER_CLASS)
 class PinConfirmationRouteTest {
 
     private static final String APPROVAL_PATH = "/operador/portability-approval";
+    private static final String RESULT_PATH = "/receptor/portability-result";
+    private static final AtomicBoolean TX_ACTIVE = new AtomicBoolean();
+    private static final AtomicBoolean NOTIFIED_DURING_TX = new AtomicBoolean();
     private static final WireMockServer DONOR = startDonor();
 
     private static WireMockServer startDonor() {
         var server = new WireMockServer(wireMockConfig().dynamicPort().usingFilesUnderDirectory("wiremock"));
+        server.addMockServiceRequestListener((request, response) -> {
+            if (request.getUrl().equals(RESULT_PATH) && TX_ACTIVE.get()) {
+                NOTIFIED_DURING_TX.set(true);
+            }
+        });
         server.start();
         return server;
     }
@@ -91,26 +108,40 @@ class PinConfirmationRouteTest {
     private DataSource dataSource;
     @MockitoBean
     private ConnectionFactory connectionFactory;
+    @MockitoBean
+    private PlatformTransactionManager transactionManager;
 
     @BeforeEach
     void setClock() {
         DONOR.resetToDefaultMappings();
+        TX_ACTIVE.set(false);
+        NOTIFIED_DURING_TX.set(false);
+        when(transactionManager.getTransaction(any())).thenAnswer(call -> {
+            TX_ACTIVE.set(true);
+            return new SimpleTransactionStatus();
+        });
+        doAnswer(call -> { TX_ACTIVE.set(false); return null; }).when(transactionManager).commit(any());
+        doAnswer(call -> { TX_ACTIVE.set(false); return null; }).when(transactionManager).rollback(any());
         when(clock.instant()).thenReturn(FIXED_CLOCK.instant());
         when(clock.getZone()).thenReturn(FIXED_CLOCK.getZone());
     }
 
     @AfterEach
     void noExternalInfrastructure() {
-        verifyNoInteractions(dataSource, connectionFactory, portedNumbers);
+        verifyNoInteractions(dataSource, connectionFactory);
+        assertThat(NOTIFIED_DURING_TX).isFalse();
+        assertThat(TX_ACTIVE).isFalse();
     }
 
     @ParameterizedTest
-    @ValueSource(strings = {"Tigo", "Personal", "Claro", "Vox"})
-    void confirmsThenRequestsApprovalForEachDonor(String donor) throws Exception {
-        givenRequest(PortabilityStatus.PIN_GENERATED, NOW.plusMinutes(1), donor, "12345");
+    @CsvSource({"Tigo, Personal", "Personal, Tigo", "Claro, Vox", "Vox, Claro"})
+    void completesAndNotifiesEachReceiver(String donor, String receiver) throws Exception {
+        givenRequest(PortabilityStatus.PIN_GENERATED, NOW.plusMinutes(1), donor, "12345", receiver);
         when(repository.confirmPin(ID, NOW)).thenReturn(1);
         when(repository.markPendingDonor(ID)).thenReturn(1);
         when(repository.approveByDonor(ID)).thenReturn(1);
+        when(portedNumbers.insert(any())).thenReturn(1);
+        when(repository.markCompleted(ID, NOW)).thenReturn(1);
 
         var response = post("{\"pin\":\"000042\"}");
         assertThat(response.statusCode()).isEqualTo(200);
@@ -118,24 +149,29 @@ class PinConfirmationRouteTest {
         var body = mapper.readTree(response.body());
         assertThat(body.size()).isEqualTo(3);
         assertThat(body.path("id").asText()).isEqualTo(ID);
-        assertThat(body.path("estado").asText()).isEqualTo("APPROVED");
-        assertThat(body.path("mensaje").asText()).isEqualTo("Solicitud aprobada por el operador donante");
+        assertThat(body.path("estado").asText()).isEqualTo("COMPLETED");
+        assertThat(body.path("mensaje").asText()).isEqualTo("Portabilidad completada correctamente");
         assertThat(body.has("pin")).isFalse();
-        var order = inOrder(repository);
+        var order = inOrder(repository, portedNumbers, transactionManager);
         order.verify(repository).findById(ID);
         order.verify(repository).confirmPin(ID, NOW);
         order.verify(repository).markPendingDonor(ID);
         order.verify(repository).approveByDonor(ID);
+        order.verify(transactionManager).getTransaction(any());
+        order.verify(portedNumbers).insert(new PortedNumber("+595971234567", donor, receiver, NOW));
+        order.verify(repository).markCompleted(ID, NOW);
+        order.verify(transactionManager).commit(any());
         order.verifyNoMoreInteractions();
         DONOR.verify(1, postRequestedFor(urlEqualTo(APPROVAL_PATH))
                 .withHeader("X-Operador-Donante", equalTo(donor))
                 .withRequestBody(matchingJsonPath("$.request_id", equalTo(ID)))
                 .withRequestBody(matchingJsonPath("$.msisdn", equalTo("+595971234567")))
                 .withRequestBody(matchingJsonPath("$.documento_titular", equalTo("12345")))
-                .withRequestBody(matchingJsonPath("$.operador_receptor", equalTo(donor.equals("Personal") ? "Tigo" : "Personal"))));
-        var sent = mapper.readTree(DONOR.getAllServeEvents().getFirst().getRequest().getBodyAsString());
+                .withRequestBody(matchingJsonPath("$.operador_receptor", equalTo(receiver))));
+        var sent = mapper.readTree(DONOR.findAll(postRequestedFor(urlEqualTo(APPROVAL_PATH))).getFirst().getBodyAsString());
         assertThat(sent.size()).isEqualTo(4);
         assertThat(sent.has("pin")).isFalse();
+        assertReceiverNotification(donor, receiver, "COMPLETED", null);
     }
 
     @Test
@@ -238,8 +274,12 @@ class PinConfirmationRouteTest {
     }
 
     private void givenRequest(PortabilityStatus status, OffsetDateTime expiration, String donor, String document) {
+        givenRequest(status, expiration, donor, document, donor.equals("Personal") ? "Tigo" : "Personal");
+    }
+
+    private void givenRequest(PortabilityStatus status, OffsetDateTime expiration, String donor, String document, String receiver) {
         when(repository.findById(ID)).thenReturn(Optional.of(new PortabilityRequest(ID, "+595971234567",
-                document, donor, donor.equals("Personal") ? "Tigo" : "Personal", status, "000042", expiration, 2,
+                document, donor, receiver, status, "000042", expiration, 2,
                 NOW.minusMinutes(20), NOW.minusMinutes(14), null, null, null)));
     }
 
@@ -250,9 +290,9 @@ class PinConfirmationRouteTest {
     }
 
     @ParameterizedTest
-    @ValueSource(strings = {"Tigo", "Personal", "Claro", "Vox"})
-    void controlledRejectionPersistsDonorReason(String donor) throws Exception {
-        givenRequest(PortabilityStatus.PIN_GENERATED, NOW.plusMinutes(1), donor, "TEST-REJECTED");
+    @CsvSource({"Tigo, Personal", "Personal, Tigo", "Claro, Vox", "Vox, Claro"})
+    void controlledRejectionPersistsDonorReasonAndNotifiesReceiver(String donor, String receiver) throws Exception {
+        givenRequest(PortabilityStatus.PIN_GENERATED, NOW.plusMinutes(1), donor, "TEST-REJECTED", receiver);
         when(repository.confirmPin(ID, NOW)).thenReturn(1);
         when(repository.markPendingDonor(ID)).thenReturn(1);
         when(repository.rejectByDonor(ID, "Datos del titular no coinciden")).thenReturn(1);
@@ -270,6 +310,8 @@ class PinConfirmationRouteTest {
         order.verify(repository).rejectByDonor(ID, "Datos del titular no coinciden");
         order.verifyNoMoreInteractions();
         DONOR.verify(1, postRequestedFor(urlEqualTo(APPROVAL_PATH)).withHeader("X-Operador-Donante", equalTo(donor)));
+        verifyNoInteractions(portedNumbers);
+        assertReceiverNotification(donor, receiver, "REJECTED", "Datos del titular no coinciden");
     }
 
     @ParameterizedTest
@@ -364,6 +406,129 @@ class PinConfirmationRouteTest {
                     .timeout(Duration.ofSeconds(10)).header("Content-Type", "application/json")
                     .POST(HttpRequest.BodyPublishers.ofString(body)).build(), HttpResponse.BodyHandlers.ofString());
         }
+    }
+
+    @Test
+    void insertFailureDoesNotCompleteOrNotifyReceiver() throws Exception {
+        allowPendingDonor();
+        when(repository.approveByDonor(ID)).thenReturn(1);
+        when(portedNumbers.insert(any())).thenThrow(new DataAccessResourceFailureException("insert failed"));
+        assertThat(post("{\"pin\":\"000042\"}").statusCode()).isEqualTo(500);
+        verify(repository, never()).markCompleted(any(), any());
+        verify(transactionManager).rollback(any());
+        verify(transactionManager, never()).commit(any());
+        DONOR.verify(0, postRequestedFor(urlEqualTo(RESULT_PATH)));
+    }
+
+    @Test
+    void completionFailureRollsBackAndDoesNotNotifyReceiver() throws Exception {
+        allowPendingDonor();
+        when(repository.approveByDonor(ID)).thenReturn(1);
+        when(portedNumbers.insert(any())).thenReturn(1);
+        when(repository.markCompleted(ID, NOW)).thenReturn(0);
+        assertThat(post("{\"pin\":\"000042\"}").statusCode()).isEqualTo(500);
+        verify(transactionManager).rollback(any());
+        verify(transactionManager, never()).commit(any());
+        DONOR.verify(0, postRequestedFor(urlEqualTo(RESULT_PATH)));
+    }
+
+    @ParameterizedTest
+    @ValueSource(booleans = {false, true})
+    void receiverHttpFailurePreservesBusinessResult(boolean rejected) throws Exception {
+        allowFinalResult(rejected);
+        DONOR.stubFor(com.github.tomakehurst.wiremock.client.WireMock.post(urlEqualTo(RESULT_PATH))
+                .atPriority(0).willReturn(aResponse().withStatus(503).withBody("private-receiver-details")));
+        assertReceiverFailure(rejected);
+    }
+
+    @ParameterizedTest
+    @ValueSource(strings = {"{", "null", "{}",
+            "{\"request_id\":\"another-id\",\"estado\":\"RECIBIDO\"}",
+            "{\"request_id\":\"REQ-confirm-test\",\"estado\":\"UNKNOWN\"}"})
+    void malformedReceiverConfirmationPreservesCompleted(String json) throws Exception {
+        allowFinalResult(false);
+        DONOR.stubFor(com.github.tomakehurst.wiremock.client.WireMock.post(urlEqualTo(RESULT_PATH))
+                .atPriority(0).willReturn(aResponse().withStatus(200).withHeader("Content-Type", "application/json")
+                        .withBody(json)));
+        assertReceiverFailure(false);
+    }
+
+    @Test
+    void receiverTimeoutDoesNotRollBackCompletedOrResend() throws Exception {
+        allowFinalResult(false);
+        DONOR.stubFor(com.github.tomakehurst.wiremock.client.WireMock.post(urlEqualTo(RESULT_PATH))
+                .atPriority(0).willReturn(aResponse().withStatus(200).withFixedDelay(2000)));
+        assertReceiverFailure(false);
+    }
+
+    @Test
+    void receiverConnectionFailurePreservesRejection() throws Exception {
+        allowFinalResult(true);
+        DONOR.stubFor(com.github.tomakehurst.wiremock.client.WireMock.post(urlEqualTo(RESULT_PATH))
+                .atPriority(0).willReturn(aResponse().withFault(com.github.tomakehurst.wiremock.http.Fault.EMPTY_RESPONSE)));
+        assertReceiverFailure(true);
+    }
+
+    private void allowFinalResult(boolean rejected) {
+        givenRequest(PortabilityStatus.PIN_GENERATED, NOW.plusMinutes(1), "Tigo", rejected ? "TEST-REJECTED" : "12345");
+        when(repository.confirmPin(ID, NOW)).thenReturn(1);
+        when(repository.markPendingDonor(ID)).thenReturn(1);
+        if (rejected) {
+            when(repository.rejectByDonor(ID, "Datos del titular no coinciden")).thenReturn(1);
+        } else {
+            when(repository.approveByDonor(ID)).thenReturn(1);
+            when(portedNumbers.insert(any())).thenReturn(1);
+            when(repository.markCompleted(ID, NOW)).thenReturn(1);
+        }
+    }
+
+    private void assertReceiverFailure(boolean rejected) throws Exception {
+        var response = post("{\"pin\":\"000042\"}");
+        assertThat(response.statusCode()).isEqualTo(502);
+        assertJson(response);
+        var body = mapper.readTree(response.body());
+        assertThat(body.path("estado").asText()).isEqualTo("ERROR");
+        assertThat(body.path("mensaje").asText()).contains(ID, "conserva estado " + (rejected ? "REJECTED" : "COMPLETED"));
+        assertThat(response.body()).doesNotContain("private-receiver-details", "000042");
+        var order = inOrder(repository, portedNumbers, transactionManager);
+        order.verify(repository).findById(ID);
+        order.verify(repository).confirmPin(ID, NOW);
+        order.verify(repository).markPendingDonor(ID);
+        if (rejected) {
+            order.verify(repository).rejectByDonor(ID, "Datos del titular no coinciden");
+            order.verify(transactionManager).getTransaction(any());
+            verifyNoInteractions(portedNumbers);
+        } else {
+            order.verify(repository).approveByDonor(ID);
+            order.verify(transactionManager).getTransaction(any());
+            order.verify(portedNumbers).insert(new PortedNumber("+595971234567", "Tigo", "Personal", NOW));
+            order.verify(repository).markCompleted(ID, NOW);
+        }
+        order.verify(transactionManager).commit(any());
+        order.verifyNoMoreInteractions();
+        assertReceiverNotification("Tigo", "Personal", rejected ? "REJECTED" : "COMPLETED",
+                rejected ? "Datos del titular no coinciden" : null);
+    }
+
+    private void assertReceiverNotification(String donor, String receiver, String state, String reason) throws Exception {
+        DONOR.verify(1, postRequestedFor(urlEqualTo(RESULT_PATH))
+                .withHeader("X-Operador-Receptor", equalTo(receiver))
+                .withHeader("X-Operador-Donante", absent()));
+        var sent = mapper.readTree(DONOR.findAll(postRequestedFor(urlEqualTo(RESULT_PATH))).getFirst().getBodyAsString());
+        assertThat(sent.size()).isEqualTo(7);
+        assertThat(sent.path("request_id").asText()).isEqualTo(ID);
+        assertThat(sent.path("msisdn").asText()).isEqualTo("+595971234567");
+        assertThat(sent.path("estado").asText()).isEqualTo(state);
+        assertThat(sent.path("operador_donante").asText()).isEqualTo(donor);
+        assertThat(sent.path("operador_receptor").asText()).isEqualTo(receiver);
+        assertThat(OffsetDateTime.parse(sent.path("fecha_finalizacion").asText()).toInstant()).isEqualTo(NOW.toInstant());
+        if (reason == null) {
+            assertThat(sent.path("motivo").isNull()).isTrue();
+        } else {
+            assertThat(sent.path("motivo").asText()).isEqualTo(reason);
+        }
+        assertThat(sent.has("pin")).isFalse();
+        assertThat(sent.has("documento_titular")).isFalse();
     }
 
     private void assertError(HttpResponse<String> response, int status, String message) throws Exception {

@@ -152,6 +152,15 @@ public class PortabilityRequestRepository {
                 """, new MapSqlParameterSource("id", id));
     }
 
+    /** Debe ejecutarse en la misma transacción que el INSERT en ported_number. */
+    public int markCompleted(String id, OffsetDateTime completedAt) {
+        return jdbc.update("""
+                UPDATE portability_request SET estado = 'COMPLETED', fecha_completada = :fechaCompletada
+                WHERE id = :id AND estado = 'APPROVED'
+                """, new MapSqlParameterSource("id", id)
+                .addValue("fechaCompletada", completedAt, Types.TIMESTAMP_WITH_TIMEZONE));
+    }
+
     public int rejectByDonor(String id, String motivo) {
         return jdbc.update("""
                 UPDATE portability_request SET estado = 'REJECTED', motivo_rechazo = :motivo

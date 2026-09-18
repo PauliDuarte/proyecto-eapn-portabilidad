@@ -327,6 +327,24 @@ class PortabilityRequestRepositoryTest {
     }
 
     @Test
+    void completesOnlyApprovedRequestWithTimestamp() {
+        when(jdbc.update(anyString(), any(MapSqlParameterSource.class))).thenReturn(1);
+        assertThat(repository.markCompleted("req-1", COMPLETED)).isEqualTo(1);
+        var params = captureUpdate("""
+                UPDATE portability_request SET estado = 'COMPLETED', fecha_completada = :fechaCompletada
+                WHERE id = :id AND estado = 'APPROVED'
+                """);
+        assertThat(params.getValues()).hasSize(2).containsEntry("fechaCompletada", COMPLETED);
+        assertThat(params.getSqlType("fechaCompletada")).isEqualTo(Types.TIMESTAMP_WITH_TIMEZONE);
+    }
+
+    @Test
+    void completionExposesNoMatchingApprovedRequest() {
+        when(jdbc.update(anyString(), any(MapSqlParameterSource.class))).thenReturn(0);
+        assertThat(repository.markCompleted("missing", COMPLETED)).isZero();
+    }
+
+    @Test
     void pendingDonorOnlyTransitionsFromConfirmed() {
         when(jdbc.update(anyString(), any(MapSqlParameterSource.class))).thenReturn(1);
         assertThat(repository.markPendingDonor("req-1")).isEqualTo(1);
