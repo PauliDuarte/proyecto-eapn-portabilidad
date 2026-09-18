@@ -1,7 +1,8 @@
 # proyecto-eapn-portabilidad
 
 Proyecto universitario: base técnica del Desafío 1, integrador de una EAPN de
-Portabilidad Numérica en Paraguay. Todavía no incluye lógica de negocio.
+Portabilidad Numérica en Paraguay. Incluye la recepción REST, validación inicial
+y persistencia PostgreSQL de solicitudes con estado `CREATED`.
 
 **Stack:** Java 21, Gradle Wrapper 9.6.0, Spring Boot 3.5.16, Apache Camel 4.18.3
 (Java DSL), JMS con Apache ActiveMQ Artemis 2.44.0, PostgreSQL 17.6,
@@ -26,3 +27,32 @@ y `APP_TIMEZONE` (por defecto `America/Asuncion`). Exportar las variables para
 compartirlas entre Compose y `bootRun`; Spring Boot no lee `.env` automáticamente.
 El SQL inicial se ejecuta solo al crear un volumen PostgreSQL vacío.
 El test de contexto usa mocks de JDBC/JMS y no necesita contenedores.
+
+## Recepción de solicitudes
+
+`POST http://localhost:8080/portabilidad`, con `Content-Type: application/json`:
+
+```json
+{
+  "msisdn": "+595971234567",
+  "documento_titular": "0012345",
+  "operador_donante": "Tigo",
+  "operador_receptor": "Personal"
+}
+```
+
+El MSISDN debe tener `+5959` y ocho dígitos adicionales, sin espacios ni guiones
+(validación de formato móvil, no de existencia del número). Documento obligatorio,
+hasta 50 caracteres según el esquema; se recortan espacios exteriores.
+Operadores permitidos: Tigo, Personal, Claro y Vox; se normalizan mayúsculas y
+espacios exteriores, y donante/receptor deben ser distintos.
+
+Devuelve HTTP 201 con `id`, `msisdn`, `operador_donante`, `operador_receptor`,
+`estado` y `fecha_creacion` en ISO 8601. El ID es `REQ-YYYYMMDD-<UUID v4 sin guiones>`:
+fecha en `APP_TIMEZONE` y sufijo de 32 caracteres hexadecimales. Se guarda `CREATED`,
+cero intentos, y PIN y demás fechas nulos.
+
+Errores de validación o JSON devuelven HTTP 400 con
+`{"estado":"RECHAZADA","mensaje":"..."}`, sin insertar. Un error de persistencia
+devuelve HTTP 500; no se informa como rechazo de negocio ni como creación exitosa.
+Los tests de servicio y HTTP usan mocks de persistencia, sin infraestructura externa.

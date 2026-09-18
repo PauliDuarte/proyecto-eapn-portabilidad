@@ -22,6 +22,7 @@ dependencies {
 
     implementation 'org.apache.camel.springboot:camel-spring-boot-starter'
     implementation 'org.apache.camel.springboot:camel-rest-starter'
+    implementation 'org.apache.camel.springboot:camel-platform-http-starter'
     implementation 'org.apache.camel.springboot:camel-jms-starter'
     implementation 'org.apache.camel.springboot:camel-jackson-starter'
     implementation 'org.springframework.boot:spring-boot-starter-artemis'

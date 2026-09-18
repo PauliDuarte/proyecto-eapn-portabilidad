@@ -14,7 +14,8 @@ import static org.assertj.core.api.Assertions.assertThat;
 import static org.mockito.Mockito.verifyNoInteractions;
 
 @CamelSpringBootTest
-@SpringBootTest(properties = "camel.springboot.main-run-controller=false")
+@SpringBootTest(webEnvironment = SpringBootTest.WebEnvironment.RANDOM_PORT,
+        properties = "camel.springboot.main-run-controller=false")
 class EapnApplicationTest {
 
     @MockitoBean
@@ -29,7 +30,7 @@ class EapnApplicationTest {
     @Test
     void contextLoadsWithoutExternalInfrastructure() {
         assertThat(camelContext.isStarted()).isTrue();
-        assertThat(camelContext.getRoutes()).isEmpty();
+        assertThat(camelContext.getRoutes()).isNotEmpty();
         verifyNoInteractions(dataSource, connectionFactory);
     }
 }
