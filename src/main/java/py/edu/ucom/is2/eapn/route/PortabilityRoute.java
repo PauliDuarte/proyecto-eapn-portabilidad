@@ -15,6 +15,8 @@ import org.springframework.stereotype.Component;
 import org.slf4j.Logger;
 import org.slf4j.LoggerFactory;
 
+import py.edu.ucom.is2.eapn.messaging.StateEventPublisher;
+import py.edu.ucom.is2.eapn.model.PortabilityStatus;
 import py.edu.ucom.is2.eapn.model.PortabilityRequest;
 import py.edu.ucom.is2.eapn.model.dto.CreatePortabilityRequest;
 import py.edu.ucom.is2.eapn.model.dto.PortabilityErrorResponse;
@@ -30,11 +32,13 @@ public class PortabilityRoute extends RouteBuilder {
     private final PortabilityService service;
     private final PinGenerationService pinService;
     private final ObjectMapper mapper;
+    private final StateEventPublisher events;
 
-    public PortabilityRoute(PortabilityService service, PinGenerationService pinService, ObjectMapper mapper) {
+    public PortabilityRoute(PortabilityService service, PinGenerationService pinService, ObjectMapper mapper, StateEventPublisher events) {
         this.service = service;
         this.pinService = pinService;
         this.mapper = mapper;
+        this.events = events;
     }
 
     @Override
@@ -99,10 +103,13 @@ public class PortabilityRoute extends RouteBuilder {
                 .unmarshal(new JacksonDataFormat(requestMapper, CreatePortabilityRequest.class))
                 .process(exchange -> {
                     var input = exchange.getMessage().getBody(CreatePortabilityRequest.class);
-                    exchange.getMessage().setBody(service.create(input));
+                    var request = service.create(input);
+                    events.publish(request);
+                    exchange.getMessage().setBody(request);
                 })
                 .process(exchange -> exchange.getMessage().setBody(
                         pinService.generate(exchange.getMessage().getBody(PortabilityRequest.class))))
+                .process(exchange -> events.publish(exchange.getMessage().getBody(PortabilityRequest.class)))
                 .to("direct:enviar-pin-operador")
                 .process(exchange -> exchange.getMessage().setBody(
                         PortabilityResponse.from(exchange.getMessage().getBody(PortabilityRequest.class))))

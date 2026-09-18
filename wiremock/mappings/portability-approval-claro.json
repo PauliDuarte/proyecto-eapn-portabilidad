@@ -1,0 +1,44 @@
+{
+  "name": "Aprobación de portabilidad - Claro",
+  "priority": 10,
+  "request": {
+    "method": "POST",
+    "urlPath": "/operador/portability-approval",
+    "headers": {
+      "X-Operador-Donante": {
+        "equalTo": "Claro"
+      },
+      "Content-Type": {
+        "contains": "application/json"
+      }
+    },
+    "bodyPatterns": [
+      {
+        "matchesJsonPath": "$.request_id"
+      },
+      {
+        "matchesJsonPath": "$.msisdn"
+      },
+      {
+        "matchesJsonPath": "$.documento_titular"
+      },
+      {
+        "matchesJsonPath": "$.operador_receptor"
+      }
+    ]
+  },
+  "response": {
+    "status": 200,
+    "headers": {
+      "Content-Type": "application/json"
+    },
+    "jsonBody": {
+      "request_id": "{{jsonPath request.body '$.request_id'}}",
+      "estado": "APPROVED",
+      "motivo": null
+    },
+    "transformers": [
+      "response-template"
+    ]
+  }
+}

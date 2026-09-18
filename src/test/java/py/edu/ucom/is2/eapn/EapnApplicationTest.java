@@ -15,7 +15,7 @@ import static org.mockito.Mockito.verifyNoInteractions;
 
 @CamelSpringBootTest
 @SpringBootTest(webEnvironment = SpringBootTest.WebEnvironment.RANDOM_PORT,
-        properties = "camel.springboot.main-run-controller=false")
+        properties = {"camel.springboot.main-run-controller=false", "app.messaging.enabled=false"})
 class EapnApplicationTest {
 
     @MockitoBean

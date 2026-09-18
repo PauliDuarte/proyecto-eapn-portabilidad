@@ -116,6 +116,58 @@ public class PortabilityRequestRepository {
                 new MapSqlParameterSource("id", id).addValue("motivo", motivo, Types.VARCHAR));
     }
 
+    /** Confirma e incrementa el intento en una sola escritura, solo desde PIN_GENERATED. */
+    public int confirmPin(String id, OffsetDateTime confirmado) {
+        return jdbc.update("""
+                UPDATE portability_request
+                SET estado = 'CONFIRMED', fecha_pin_confirmado = :fechaPinConfirmado,
+                    intentos_confirmacion = intentos_confirmacion + 1, motivo_rechazo = NULL
+                WHERE id = :id AND estado = 'PIN_GENERATED'
+                """, new MapSqlParameterSource("id", id)
+                .addValue("fechaPinConfirmado", confirmado, Types.TIMESTAMP_WITH_TIMEZONE));
+    }
+
+    /** Rechaza por PIN e incrementa el intento sin marcar la portación como completada. */
+    public int rejectPinConfirmation(String id, String motivo) {
+        return jdbc.update("""
+                UPDATE portability_request
+                SET estado = 'REJECTED', motivo_rechazo = :motivo,
+                    intentos_confirmacion = intentos_confirmacion + 1
+                WHERE id = :id AND estado = 'PIN_GENERATED'
+                """, new MapSqlParameterSource("id", id)
+                .addValue("motivo", motivo, Types.VARCHAR));
+    }
+
+    public int markPendingDonor(String id) {
+        return jdbc.update("""
+                UPDATE portability_request SET estado = 'PENDING_DONOR'
+                WHERE id = :id AND estado = 'CONFIRMED'
+                """, new MapSqlParameterSource("id", id));
+    }
+
+    public int approveByDonor(String id) {
+        return jdbc.update("""
+                UPDATE portability_request SET estado = 'APPROVED', motivo_rechazo = NULL
+                WHERE id = :id AND estado = 'PENDING_DONOR'
+                """, new MapSqlParameterSource("id", id));
+    }
+
+    /** Debe ejecutarse en la misma transacción que el INSERT en ported_number. */
+    public int markCompleted(String id, OffsetDateTime completedAt) {
+        return jdbc.update("""
+                UPDATE portability_request SET estado = 'COMPLETED', fecha_completada = :fechaCompletada
+                WHERE id = :id AND estado = 'APPROVED'
+                """, new MapSqlParameterSource("id", id)
+                .addValue("fechaCompletada", completedAt, Types.TIMESTAMP_WITH_TIMEZONE));
+    }
+
+    public int rejectByDonor(String id, String motivo) {
+        return jdbc.update("""
+                UPDATE portability_request SET estado = 'REJECTED', motivo_rechazo = :motivo
+                WHERE id = :id AND estado = 'PENDING_DONOR'
+                """, new MapSqlParameterSource("id", id).addValue("motivo", motivo, Types.VARCHAR));
+    }
+
     /** Permite una fecha nula si se registra un rechazo sin portación completada. */
     public int updateCompletion(String id, OffsetDateTime completada, String motivoRechazo) {
         return jdbc.update("""
